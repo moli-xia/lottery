@@ -1,0 +1,13 @@
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.git
+.env
+.DS_Store
+.vscode
+backend/lottery.db
+backend/backend.log
+backend/backend_new.log
+frontend/dist

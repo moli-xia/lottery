@@ -1,0 +1,27 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="r" cx="30%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#ffd1d1" />
+      <stop offset="38%" stop-color="#ff4d4f" />
+      <stop offset="100%" stop-color="#8a0f12" />
+    </radialGradient>
+    <radialGradient id="b" cx="30%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#d4e9ff" />
+      <stop offset="38%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#0b2a6f" />
+    </radialGradient>
+    <filter id="s" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="blur" />
+      <feOffset dx="0" dy="12" result="off" />
+      <feColorMatrix in="off" type="matrix" values="0 0 0 0 0   0 0 0 0 0   0 0 0 0 0   0 0 0 0.25 0" result="shadow" />
+      <feMerge>
+        <feMergeNode in="shadow" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#s)">
+    <circle cx="212" cy="280" r="150" fill="url(#r)" />
+    <circle cx="352" cy="252" r="120" fill="url(#b)" />
+  </g>
+</svg>

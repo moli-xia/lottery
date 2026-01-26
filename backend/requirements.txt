@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy
+requests
+beautifulsoup4
+openai
+pandas
+python-multipart
+pydantic-settings
