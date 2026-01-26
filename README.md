@@ -1,73 +1,123 @@
-# Lottery Prediction Assistant (魔力彩票助手)
+# Lottery Prediction Assistant（魔力彩票助手）
 
-基于历史数据抓取与大模型（LLM）分析的中国福利彩票（双色球）与体育彩票（大乐透）预测辅助系统。
+基于历史数据抓取与大模型（LLM）分析的双色球（ssq）与大乐透（dlt）预测辅助系统，提供前台页面与后台管理（LLM 配置 / 手动抓取 / 测试）。
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Docker](https://img.shields.io/badge/docker-superneed%2Flottery-blue)
-![Python](https://img.shields.io/badge/python-3.9+-green.svg)
-![Vue](https://img.shields.io/badge/vue-3.x-green.svg)
+## 功能概览
 
-## ✨ 核心功能
+- 自动抓取历史开奖数据，并按开奖时间智能定时更新
+- 支持 OpenAI 兼容的 `/chat/completions` 接口（默认：siliconflow + DeepSeek-R1）
+- 前端实时刷新（SSE），后端 FastAPI + SQLite 持久化
+- 后台 `/admin`：配置 LLM、测试连通性、修改后台密码
 
-- **📊 自动抓取**：自动从官方渠道抓取双色球和大乐透的历史开奖数据。
-  - 智能定时抓取：根据实际开奖时间（双色球 周二/四/日 21:15，大乐透 周一/三/六 21:25）自动更新。
-- **🤖 AI 推算**：集成大语言模型（支持 DeepSeek-V3 等 OpenAI 兼容接口）。
-  - 基于最新开奖数据及历史走势，智能生成下期预测号码。
-  - 自动生成20组高价值推算结果。
-- **📱 现代化界面**：
-  - 响应式设计，完美适配移动端与桌面端。
-  - 实时数据流（Server-Sent Events），无需刷新即可获取最新开奖。
-  - 优雅的 Toast 通知系统。
-- **🔒 后台管理**：
-  - 独立的 `/admin` 管理后台。
-  - 可视化配置 LLM API Key、模型参数。
-  - 手动触发抓取与测试功能。
+## Docker 部署（推荐）
 
-## 🚀 快速部署 (Docker)
+镜像地址：`superneed/lottery`（支持 `linux/amd64` 与 `linux/arm64`）
 
-本项目提供开箱即用的 Docker 镜像，支持 `amd64` 和 `arm64` 架构。
-
-### 1. 启动容器
+### 1) 从 Docker Hub 拉取镜像
 
 ```bash
-# 推荐挂载数据库文件以持久化配置和历史数据
+docker pull superneed/lottery:latest
+```
+
+### 2) 运行容器（带数据持久化）
+
+```bash
 touch lottery.db
 
 docker run -d \
-  -p 8888:8888 \
-  -v $(pwd)/lottery.db:/app/lottery.db \
   --name lottery \
+  -p 8888:8888 \
+  -v "$(pwd)/lottery.db:/app/lottery.db" \
+  -e TZ=Asia/Shanghai \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=admin \
+  -e SESSION_SECRET="$(openssl rand -hex 32)" \
   --restart always \
   superneed/lottery:latest
 ```
 
-### 2. 配置系统
+- 前台：`http://<your-ip>:8888/`
+- 后台：`http://<your-ip>:8888/admin`（默认账号密码：`admin/admin`，建议首次登录后修改密码）
 
-1. 访问管理后台：`http://your-ip:8888/admin`
-2. 默认密码请检查容器日志或自行设置（首次启动可能无密码或默认 `admin`，视具体配置而定）。
-3. 在后台配置 **LLM API Key**（推荐使用 DeepSeek-V3）。
+### 3) 在后台配置 LLM
 
-### 3. 访问前台
+进入 `/admin` 后可配置：
 
-访问 `http://your-ip:8888` 即可查看最新开奖与 AI 推算结果。
+- LLM API Key（必填）
+- LLM Base URL（可选，默认 `https://api.siliconflow.cn/v1`）
+- LLM 模型名（默认 `deepseek-ai/DeepSeek-R1`）
 
-## 🛠️ 本地开发
+### 常用运维命令
+
+```bash
+docker logs -f lottery
+docker restart lottery
+docker exec -it lottery python -V
+```
+
+### 升级镜像（不丢数据）
+
+```bash
+docker pull superneed/lottery:latest
+docker rm -f lottery
+docker run -d \
+  --name lottery \
+  -p 8888:8888 \
+  -v "$(pwd)/lottery.db:/app/lottery.db" \
+  -e TZ=Asia/Shanghai \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=admin \
+  -e SESSION_SECRET="$(openssl rand -hex 32)" \
+  --restart always \
+  superneed/lottery:latest
+```
+
+## 从源码构建 Docker 镜像
+
+### 单机构建（本地使用）
+
+```bash
+docker build -t superneed/lottery:local .
+docker run --rm -p 8888:8888 superneed/lottery:local
+```
+
+### 多架构构建并推送到 Docker Hub
+
+仓库内已提供脚本 [build_docker.sh](file:///www/wwwroot/gamble/build_docker.sh)：
+
+```bash
+docker login
+bash build_docker.sh
+```
+
+等价手动命令如下：
+
+```bash
+docker login
+docker buildx create --use --name mybuilder || docker buildx use mybuilder
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t superneed/lottery:latest \
+  --push \
+  .
+```
+
+## 本地开发
 
 ### 环境要求
+
 - Python 3.9+
 - Node.js 18+
 
-### 1. 后端启动
+### 后端启动
 
 ```bash
 cd backend
 pip install -r requirements.txt
-
-# 初始化数据库（自动）并启动
-python -m uvicorn main:app --reload --port 8888
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8888
 ```
 
-### 2. 前端启动
+### 前端启动
 
 ```bash
 cd frontend
@@ -75,26 +125,25 @@ npm install
 npm run dev
 ```
 
-## 📜 目录结构
+默认前端开发服务器由 Vite 提供，后端 API 运行在 `http://localhost:8888`。
+
+## 配置项（环境变量）
+
+- `TZ`：时区（默认 `Asia/Shanghai`）
+- `ADMIN_USERNAME`：后台用户名（默认 `admin`）
+- `ADMIN_PASSWORD`：后台初始密码（默认 `admin`，首次修改密码后以数据库内保存为准）
+- `SESSION_SECRET`：后台会话密钥（默认 `dev-secret`，生产环境务必设置为随机值）
+
+## 目录结构
 
 ```
 .
-├── backend/            # Python FastAPI 后端
-│   ├── main.py         # 应用入口
-│   ├── models.py       # 数据库模型
-│   ├── scraper.py      # 数据抓取爬虫
-│   └── predictor.py    # AI 预测逻辑
+├── backend/            # FastAPI 后端
 ├── frontend/           # Vue 3 前端
-│   ├── src/            # 源代码
-│   └── dist/           # 构建产物
-├── Dockerfile          # 多架构构建配置
-└── build_docker.sh     # 构建脚本
+├── Dockerfile          # 多阶段构建：前端构建 + 后端运行
+└── build_docker.sh     # buildx 多架构构建并推送
 ```
 
-## 🤝 贡献
+## License
 
-欢迎提交 Issue 或 Pull Request！
-
-## 📄 开源协议
-
-MIT License
+MIT

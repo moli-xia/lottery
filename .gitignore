@@ -1,0 +1,14 @@
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.py[cod]
+__pycache__/
+
+.env
+.env.*
+
+frontend/node_modules/
+frontend/dist/
+
+.DS_Store
