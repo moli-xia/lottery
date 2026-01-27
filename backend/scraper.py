@@ -15,9 +15,10 @@ class LotteryScraper:
         }
 
     def scrape_ssq(self, limit=100):
-        url = f"http://datachart.500.com/ssq/history/newinc/history.php?limit={limit}&sort=0"
+        url = f"https://datachart.500.com/ssq/history/newinc/history.php?limit={limit}&sort=0"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=20)
+            response.raise_for_status()
             response.encoding = 'utf-8'
             soup = BeautifulSoup(response.text, 'html.parser')
             tdata = soup.find('tbody', id='tdata')
@@ -40,10 +41,14 @@ class LotteryScraper:
                     # sales = cols[13].text.strip().replace(',', '')
                     # pool = cols[14].text.strip().replace(',', '')
                     date_str = cols[15].text.strip()
-                    try:
-                        date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    except ValueError:
-                         # Fallback if date format is weird or missing
+                    date = None
+                    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+                        try:
+                            date = datetime.strptime(date_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if date is None:
                         continue
 
                     existing = self.db.query(models.LotteryRecord).filter_by(lottery_type='ssq', issue=issue).first()
@@ -68,9 +73,10 @@ class LotteryScraper:
             return 0
 
     def scrape_dlt(self, limit=100):
-        url = f"http://datachart.500.com/dlt/history/newinc/history.php?limit={limit}&sort=0"
+        url = f"https://datachart.500.com/dlt/history/newinc/history.php?limit={limit}&sort=0"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=20)
+            response.raise_for_status()
             response.encoding = 'utf-8'
             soup = BeautifulSoup(response.text, 'html.parser')
             tdata = soup.find('tbody', id='tdata')
@@ -91,9 +97,14 @@ class LotteryScraper:
                     reds = ",".join([cols[i].text.strip() for i in range(1, 6)])
                     blues = ",".join([cols[i].text.strip() for i in range(6, 8)])
                     date_str = cols[14].text.strip()
-                    try:
-                        date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    except ValueError:
+                    date = None
+                    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+                        try:
+                            date = datetime.strptime(date_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if date is None:
                         continue
 
                     existing = self.db.query(models.LotteryRecord).filter_by(lottery_type='dlt', issue=issue).first()

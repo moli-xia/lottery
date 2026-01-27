@@ -7,3 +7,4 @@ openai
 pandas
 python-multipart
 pydantic-settings
+itsdangerous

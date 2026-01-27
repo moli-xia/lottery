@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, urlunparse
 import asyncio
 import base64
 import hashlib
@@ -16,9 +17,21 @@ import json
 import logging
 import os
 import sys
+import subprocess
+import shutil
+
+
+
+
+# Configure logging
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
 import secrets
 import time
-
 import requests
 
 # Add current directory to sys.path
@@ -32,6 +45,19 @@ import predictor
 logger = logging.getLogger(__name__)
 
 _llm_status: dict[str, dict] = {"ssq": {}, "dlt": {}}
+
+def _dt_to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    try:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        try:
+            return dt.isoformat()
+        except Exception:
+            return None
 
 def ensure_schema():
     with database.engine.begin() as conn:
@@ -132,6 +158,15 @@ ensure_schema()
 
 app = FastAPI(title="魔力彩票助手 API")
 
+# Disable caching for all responses
+@app.middleware("http")
+async def add_no_cache_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -159,30 +194,17 @@ def set_setting(db: Session, key: str, value: str):
         db.add(models.AppSettings(key=key, value=value))
     db.commit()
 
-DEFAULT_LLM_BASE_URL = "https://api.siliconflow.cn/v1"
-DEFAULT_LLM_MODEL = "deepseek-ai/DeepSeek-R1"
-
-def ensure_default_llm_settings():
-    db = database.SessionLocal()
-    try:
-        base_url = get_setting(db, "llm_base_url")
-        model = get_setting(db, "llm_model")
-        if not base_url:
-            set_setting(db, "llm_base_url", DEFAULT_LLM_BASE_URL)
-        if not model:
-            set_setting(db, "llm_model", DEFAULT_LLM_MODEL)
-    finally:
-        db.close()
-
 def hash_password(password: str, salt: Optional[bytes] = None, iterations: int = 120_000) -> str:
+    import secrets as _secrets
     if salt is None:
-        salt = secrets.token_bytes(16)
+        salt = _secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     salt_b64 = base64.urlsafe_b64encode(salt).decode("utf-8").rstrip("=")
     dk_b64 = base64.urlsafe_b64encode(dk).decode("utf-8").rstrip("=")
     return f"pbkdf2_sha256${iterations}${salt_b64}${dk_b64}"
 
 def verify_password(password: str, stored: str) -> bool:
+    import secrets as _secrets
     try:
         algo, iterations_s, salt_b64, dk_b64 = stored.split("$", 3)
         if algo != "pbkdf2_sha256":
@@ -191,7 +213,7 @@ def verify_password(password: str, stored: str) -> bool:
         salt = base64.urlsafe_b64decode(salt_b64 + "==")
         expected = base64.urlsafe_b64decode(dk_b64 + "==")
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-        return secrets.compare_digest(actual, expected)
+        return _secrets.compare_digest(actual, expected)
     except Exception:
         return False
 
@@ -226,16 +248,18 @@ def parse_basic_auth(request: Request) -> Optional[tuple[str, str]]:
     return username, password
 
 def verify_admin_credentials(db: Session, username: str, password: str) -> bool:
+    import secrets as _secrets
     admin_user = os.getenv("ADMIN_USERNAME", "admin")
-    if not secrets.compare_digest(username, admin_user):
+    if not _secrets.compare_digest(username, admin_user):
         return False
     stored = ensure_admin_password_hash(db)
     return verify_password(password, stored)
 
 def is_admin_session(request: Request, db: Session) -> bool:
+    import secrets as _secrets
     admin_user = os.getenv("ADMIN_USERNAME", "admin")
     sess_user = request.session.get("admin")
-    return isinstance(sess_user, str) and secrets.compare_digest(sess_user, admin_user)
+    return isinstance(sess_user, str) and _secrets.compare_digest(sess_user, admin_user)
 
 def require_admin_api(request: Request, db: Session) -> str:
     if is_admin_session(request, db):
@@ -265,6 +289,25 @@ class SettingsUpdate(BaseModel):
 class AdminPasswordChange(BaseModel):
     old_password: str
     new_password: str
+
+def _run_command(args: list[str], timeout: int = 30) -> dict:
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return {
+            "cmd": " ".join(args),
+            "ok": p.returncode == 0,
+            "code": p.returncode,
+            "stdout": (p.stdout or "")[:2000],
+            "stderr": (p.stderr or "")[:2000],
+        }
+    except Exception as e:
+        return {"cmd": " ".join(args), "ok": False, "code": None, "stdout": "", "stderr": str(e)[:2000]}
+
+def _which(name: str) -> bool:
+    try:
+        return bool(shutil.which(name))
+    except Exception:
+        return False
 
 class LotteryRecordOut(BaseModel):
     lottery_type: str
@@ -332,15 +375,38 @@ def get_predictions(lottery_type: str, limit: int = 5, offset: int = 0, db: Sess
     if not latest:
         return {"based_on_issue": None, "items": [], "llm": None}
 
-    q = (
+    all_rows = (
         db.query(models.PredictionRecord)
         .filter_by(lottery_type=lottery_type, based_on_issue=latest.issue)
         .filter(models.PredictionRecord.used_llm == True)
-        .order_by(models.PredictionRecord.sequence.asc())
-        .offset(offset)
-        .limit(limit)
         .all()
     )
+    if all_rows:
+        red_w, blue_w = build_number_weights(db, lottery_type)
+        ranked = sorted(
+            all_rows,
+            key=lambda p: (
+                -score_prediction(lottery_type, p.red_balls, p.blue_balls, red_w, blue_w),
+                p.sequence,
+                p.id,
+            ),
+        )
+        top = ranked[0]
+        q = ranked[offset : offset + limit]
+        configured_base_url = get_setting(db, "llm_base_url") or ""
+        llm = {
+            "used": True,
+            "model": top.llm_model or (get_setting(db, "llm_model") or None),
+            "base_url": configured_base_url or None,
+            "latency_ms": top.llm_latency_ms,
+            "created_at": _dt_to_utc_iso(top.created_at),
+        }
+    else:
+        q = []
+        try:
+            llm = get_llm_status(lottery_type, db=db)
+        except Exception:
+            llm = None
     items = [
         PredictionOut(
             id=p.id,
@@ -349,7 +415,7 @@ def get_predictions(lottery_type: str, limit: int = 5, offset: int = 0, db: Sess
             target_issue=p.target_issue,
             red_balls=p.red_balls,
             blue_balls=p.blue_balls,
-            created_at=p.created_at.isoformat() if p.created_at else "",
+            created_at=_dt_to_utc_iso(p.created_at) or "",
             evaluated=bool(p.evaluated),
             actual_issue=p.actual_issue,
             red_hits=p.red_hits,
@@ -358,20 +424,336 @@ def get_predictions(lottery_type: str, limit: int = 5, offset: int = 0, db: Sess
         ).model_dump()
         for p in q
     ]
-    if q:
-        configured_base_url = get_setting(db, "llm_base_url") or ""
-        llm = {
-            "used": True,
-            "model": q[0].llm_model or (get_setting(db, "llm_model") or None),
-            "base_url": configured_base_url or None,
-            "latency_ms": q[0].llm_latency_ms,
+    return {"based_on_issue": latest.issue, "items": items, "llm": llm}
+
+@app.get("/api/hit-stats/{lottery_type}")
+def get_hit_stats(lottery_type: str, db: Session = Depends(get_db), cycles_limit: int = 12):
+    latest = (
+        db.query(models.LotteryRecord)
+        .filter_by(lottery_type=lottery_type)
+        .order_by(models.LotteryRecord.issue.desc())
+        .first()
+    )
+    latest_issue = latest.issue if latest else None
+
+    try:
+        evaluate_predictions(db, lottery_type)
+    except Exception:
+        pass
+
+    def parse_nums(value: Optional[str]) -> list[str]:
+        if not value:
+            return []
+        return [s.strip() for s in str(value).split(",") if s.strip()]
+
+    def build_demo_payload() -> dict:
+        demo_actual_issue = latest_issue or ("2026010" if lottery_type == "ssq" else "2026007")
+        demo_based_on_issue = str(int(demo_actual_issue) - 1) if str(demo_actual_issue).isdigit() else demo_actual_issue
+        if lottery_type == "dlt":
+            actual_red_balls = "03,08,12,19,30"
+            actual_blue_balls = "02,11"
+            red_a = "03,07,12,21,30"
+            red_b = "01,08,11,19,29"
+            blue_a = "02,11"
+            blue_b = "04,10"
+        else:
+            actual_red_balls = "02,09,16,20,24,31"
+            actual_blue_balls = "12"
+            red_a = "02,07,16,21,24,31"
+            red_b = "01,09,12,20,27,33"
+            blue_a = "12"
+            blue_b = "05"
+
+        actual_red_set = set(parse_nums(actual_red_balls))
+        actual_blue_set = set(parse_nums(actual_blue_balls))
+
+        recent_predictions = []
+        for i in range(20):
+            red_balls = red_a if i % 2 == 0 else red_b
+            blue_balls = blue_a if i % 3 == 0 else blue_b
+            red_hits = sum(1 for n in parse_nums(red_balls) if n in actual_red_set)
+            blue_hits = sum(1 for n in parse_nums(blue_balls) if n in actual_blue_set)
+            total_hits = red_hits + blue_hits
+            recent_predictions.append(
+                {
+                    "id": f"demo-{lottery_type}-{i}",
+                    "sequence": i,
+                    "red_balls": red_balls,
+                    "blue_balls": blue_balls,
+                    "actual_red_balls": actual_red_balls,
+                    "actual_blue_balls": actual_blue_balls,
+                    "red_hits": red_hits,
+                    "blue_hits": blue_hits,
+                    "total_hits": total_hits,
+                    "based_on_issue": demo_based_on_issue,
+                    "actual_issue": demo_actual_issue,
+                }
+            )
+
+        total_predictions = len(recent_predictions)
+        total_red_hits = sum(p["red_hits"] for p in recent_predictions)
+        total_blue_hits = sum(p["blue_hits"] for p in recent_predictions)
+        total_hits = sum(p["total_hits"] for p in recent_predictions)
+        total_pred_red = sum(len(parse_nums(p["red_balls"])) for p in recent_predictions)
+        total_pred_blue = sum(len(parse_nums(p["blue_balls"])) for p in recent_predictions)
+        total_pred_nums = total_pred_red + total_pred_blue
+        max_total_hits = max((p["total_hits"] for p in recent_predictions), default=0)
+
+        thresholds = {1: 0, 3: 0, 5: 0}
+        for p in recent_predictions:
+            hits = p["total_hits"]
+            for k in thresholds:
+                if hits >= k:
+                    thresholds[k] += 1
+
+        latest_summary = {
+            "actual_issue": demo_actual_issue,
+            "based_on_issue": demo_based_on_issue,
+            "actual_red_balls": actual_red_balls,
+            "actual_blue_balls": actual_blue_balls,
+            "total_predictions": total_predictions,
+            "total_red_hits": total_red_hits,
+            "total_blue_hits": total_blue_hits,
+            "total_hits": total_hits,
+            "avg_red_hits": round(total_red_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_blue_hits": round(total_blue_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_total_hits": round(total_hits / total_predictions, 2) if total_predictions else 0,
+            "max_total_hits": max_total_hits,
+            "hit_ratio": round(total_hits / total_pred_nums, 4) if total_pred_nums else 0,
+            "red_hit_ratio": round(total_red_hits / total_pred_red, 4) if total_pred_red else 0,
+            "blue_hit_ratio": round(total_blue_hits / total_pred_blue, 4) if total_pred_blue else 0,
+            "groups_ge_1": thresholds[1],
+            "groups_ge_3": thresholds[3],
+            "groups_ge_5": thresholds[5],
+        }
+
+        cycles = []
+        base_hit_ratio = latest_summary["hit_ratio"]
+        for i in range(10):
+            issue = str(int(demo_actual_issue) - i) if str(demo_actual_issue).isdigit() else demo_actual_issue
+            hit_ratio = max(0.0, min(1.0, float(base_hit_ratio) - i * 0.01))
+            cycles.append(
+                {
+                    "actual_issue": issue,
+                    "based_on_issue": demo_based_on_issue,
+                    "actual_red_balls": actual_red_balls,
+                    "actual_blue_balls": actual_blue_balls,
+                    "total_predictions": total_predictions,
+                    "total_hits": total_hits,
+                    "avg_total_hits": latest_summary["avg_total_hits"],
+                    "max_total_hits": max_total_hits,
+                    "hit_ratio": round(hit_ratio, 4),
+                }
+            )
+
+        best = max(recent_predictions, key=lambda p: p["total_hits"], default=None)
+        cumulative_stats = {
+            "evaluated_issues": 18,
+            "total_predictions": total_predictions * 18,
+            "total_red_hits": total_red_hits * 18,
+            "total_blue_hits": total_blue_hits * 18,
+            "total_hits": total_hits * 18,
+            "avg_red_hits": latest_summary["avg_red_hits"],
+            "avg_blue_hits": latest_summary["avg_blue_hits"],
+            "avg_total_hits": latest_summary["avg_total_hits"],
+            "hit_ratio": latest_summary["hit_ratio"],
+            "red_hit_ratio": latest_summary["red_hit_ratio"],
+            "blue_hit_ratio": latest_summary["blue_hit_ratio"],
+            "hit_distribution": {},
+            "best_prediction": {
+                "red_balls": best["red_balls"] if best else red_a,
+                "blue_balls": best["blue_balls"] if best else blue_a,
+                "actual_red_balls": actual_red_balls,
+                "actual_blue_balls": actual_blue_balls,
+                "red_hits": best["red_hits"] if best else 0,
+                "blue_hits": best["blue_hits"] if best else 0,
+                "total_hits": best["total_hits"] if best else 0,
+                "actual_issue": demo_actual_issue,
+            },
+        }
+
+        return {
+            "latest_issue": latest_issue,
+            "latest_evaluated_issue": demo_actual_issue,
+            "recent_predictions": recent_predictions,
+            "latest_summary": latest_summary,
+            "cycles": cycles,
+            "cumulative_stats": cumulative_stats,
+            "is_demo": True,
+        }
+
+    def cycle_summary(preds: list[models.PredictionRecord]):
+        if not preds:
+            return None
+        total_predictions = len(preds)
+        total_red_hits = sum(p.red_hits or 0 for p in preds)
+        total_blue_hits = sum(p.blue_hits or 0 for p in preds)
+        total_hits = sum(p.total_hits or 0 for p in preds)
+        total_pred_red = sum(len(parse_nums(p.red_balls)) for p in preds)
+        total_pred_blue = sum(len(parse_nums(p.blue_balls)) for p in preds)
+        total_pred_nums = total_pred_red + total_pred_blue
+        max_total_hits = max((p.total_hits or 0) for p in preds) if preds else 0
+        thresholds = {1: 0, 3: 0, 5: 0}
+        for p in preds:
+            hits = p.total_hits or 0
+            for k in thresholds:
+                if hits >= k:
+                    thresholds[k] += 1
+        actual_red = preds[0].actual_red_balls
+        actual_blue = preds[0].actual_blue_balls
+        return {
+            "actual_issue": preds[0].actual_issue,
+            "based_on_issue": preds[0].based_on_issue,
+            "actual_red_balls": actual_red,
+            "actual_blue_balls": actual_blue,
+            "total_predictions": total_predictions,
+            "total_red_hits": total_red_hits,
+            "total_blue_hits": total_blue_hits,
+            "total_hits": total_hits,
+            "avg_red_hits": round(total_red_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_blue_hits": round(total_blue_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_total_hits": round(total_hits / total_predictions, 2) if total_predictions else 0,
+            "max_total_hits": max_total_hits,
+            "hit_ratio": round(total_hits / total_pred_nums, 4) if total_pred_nums else 0,
+            "red_hit_ratio": round(total_red_hits / total_pred_red, 4) if total_pred_red else 0,
+            "blue_hit_ratio": round(total_blue_hits / total_pred_blue, 4) if total_pred_blue else 0,
+            "groups_ge_1": thresholds[1],
+            "groups_ge_3": thresholds[3],
+            "groups_ge_5": thresholds[5],
+        }
+
+    latest_eval_row = (
+        db.query(models.PredictionRecord.actual_issue)
+        .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True)
+        .filter(models.PredictionRecord.actual_issue.isnot(None))
+        .order_by(models.PredictionRecord.actual_issue.desc())
+        .first()
+    )
+    latest_evaluated_issue = latest_eval_row[0] if latest_eval_row else None
+
+    if not latest_evaluated_issue:
+        return build_demo_payload()
+
+    recent_predictions = (
+        db.query(models.PredictionRecord)
+        .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True, actual_issue=latest_evaluated_issue)
+        .order_by(models.PredictionRecord.sequence.asc())
+        .limit(20)
+        .all()
+    )
+
+    recent_items = [
+        {
+            "id": p.id,
+            "sequence": p.sequence,
+            "red_balls": p.red_balls,
+            "blue_balls": p.blue_balls,
+            "actual_red_balls": p.actual_red_balls,
+            "actual_blue_balls": p.actual_blue_balls,
+            "red_hits": p.red_hits,
+            "blue_hits": p.blue_hits,
+            "total_hits": p.total_hits,
+            "based_on_issue": p.based_on_issue,
+            "actual_issue": p.actual_issue,
+        }
+        for p in recent_predictions
+    ]
+
+    latest_summary = cycle_summary(recent_predictions)
+
+    issue_rows = (
+        db.query(models.PredictionRecord.actual_issue)
+        .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True)
+        .filter(models.PredictionRecord.actual_issue.isnot(None))
+        .distinct()
+        .order_by(models.PredictionRecord.actual_issue.desc())
+        .limit(max(1, min(int(cycles_limit), 60)))
+        .all()
+    )
+    recent_issues = [r[0] for r in issue_rows if r and r[0]]
+
+    cycle_predictions = []
+    if recent_issues:
+        cycle_predictions = (
+            db.query(models.PredictionRecord)
+            .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True)
+            .filter(models.PredictionRecord.actual_issue.in_(recent_issues))
+            .order_by(models.PredictionRecord.actual_issue.desc(), models.PredictionRecord.sequence.asc())
+            .all()
+        )
+
+    grouped: dict[str, list[models.PredictionRecord]] = {}
+    for p in cycle_predictions:
+        if not p.actual_issue:
+            continue
+        grouped.setdefault(p.actual_issue, []).append(p)
+
+    cycles = []
+    for issue in recent_issues:
+        preds = grouped.get(issue, [])
+        s = cycle_summary(preds)
+        if s:
+            cycles.append(s)
+
+    all_evaluated = (
+        db.query(models.PredictionRecord)
+        .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True)
+        .all()
+    )
+
+    if all_evaluated:
+        total_predictions = len(all_evaluated)
+        total_red_hits = sum(p.red_hits or 0 for p in all_evaluated)
+        total_blue_hits = sum(p.blue_hits or 0 for p in all_evaluated)
+        total_hits = sum(p.total_hits or 0 for p in all_evaluated)
+        total_pred_red = sum(len(parse_nums(p.red_balls)) for p in all_evaluated)
+        total_pred_blue = sum(len(parse_nums(p.blue_balls)) for p in all_evaluated)
+        total_pred_nums = total_pred_red + total_pred_blue
+
+        hit_distribution = {}
+        for p in all_evaluated:
+            hits = p.total_hits or 0
+            hit_distribution[hits] = hit_distribution.get(hits, 0) + 1
+
+        best_prediction = max(all_evaluated, key=lambda p: p.total_hits or 0)
+        evaluated_issues = len({p.actual_issue for p in all_evaluated if p.actual_issue})
+
+        cumulative_stats = {
+            "evaluated_issues": evaluated_issues,
+            "total_predictions": total_predictions,
+            "total_red_hits": total_red_hits,
+            "total_blue_hits": total_blue_hits,
+            "total_hits": total_hits,
+            "avg_red_hits": round(total_red_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_blue_hits": round(total_blue_hits / total_predictions, 2) if total_predictions else 0,
+            "avg_total_hits": round(total_hits / total_predictions, 2) if total_predictions else 0,
+            "hit_ratio": round(total_hits / total_pred_nums, 4) if total_pred_nums else 0,
+            "red_hit_ratio": round(total_red_hits / total_pred_red, 4) if total_pred_red else 0,
+            "blue_hit_ratio": round(total_blue_hits / total_pred_blue, 4) if total_pred_blue else 0,
+            "hit_distribution": hit_distribution,
+            "best_prediction": {
+                "red_balls": best_prediction.red_balls,
+                "blue_balls": best_prediction.blue_balls,
+                "actual_red_balls": best_prediction.actual_red_balls,
+                "actual_blue_balls": best_prediction.actual_blue_balls,
+                "red_hits": best_prediction.red_hits,
+                "blue_hits": best_prediction.blue_hits,
+                "total_hits": best_prediction.total_hits,
+                "actual_issue": best_prediction.actual_issue,
+            },
         }
     else:
-        try:
-            llm = get_llm_status(lottery_type, db=db)
-        except Exception:
-            llm = None
-    return {"based_on_issue": latest.issue, "items": items, "llm": llm}
+        cumulative_stats = None
+
+    return {
+        "latest_issue": latest_issue,
+        "latest_evaluated_issue": latest_evaluated_issue,
+        "recent_predictions": recent_items,
+        "latest_summary": latest_summary,
+        "cycles": cycles,
+        "cumulative_stats": cumulative_stats,
+    }
+
 
 @app.post("/api/scrape/{lottery_type}")
 def scrape_data(lottery_type: str, db: Session = Depends(get_db)):
@@ -409,7 +791,7 @@ def predict_numbers(lottery_type: str, count: int = 5, db: Session = Depends(get
             target_issue=p.target_issue,
             red_balls=p.red_balls,
             blue_balls=p.blue_balls,
-            created_at=p.created_at.isoformat() if p.created_at else "",
+            created_at=_dt_to_utc_iso(p.created_at) or "",
             evaluated=bool(p.evaluated),
             actual_issue=p.actual_issue,
             red_hits=p.red_hits,
@@ -441,6 +823,35 @@ def normalize_numbers(s: str) -> list[str]:
     if not s:
         return []
     return [x.strip() for x in str(s).split(",") if x.strip()]
+
+def build_number_weights(db: Session, lottery_type: str, limit: int = 120) -> tuple[dict[str, float], dict[str, float]]:
+    records = (
+        db.query(models.LotteryRecord)
+        .filter_by(lottery_type=lottery_type)
+        .order_by(models.LotteryRecord.issue.desc())
+        .limit(limit)
+        .all()
+    )
+    red_w: dict[str, float] = {}
+    blue_w: dict[str, float] = {}
+    for i, r in enumerate(records):
+        decay = 0.985 ** i
+        for n in normalize_numbers(r.red_balls):
+            red_w[n] = red_w.get(n, 0.0) + decay
+        for n in normalize_numbers(r.blue_balls):
+            blue_w[n] = blue_w.get(n, 0.0) + decay
+    return red_w, blue_w
+
+def score_prediction(lottery_type: str, red_balls: str, blue_balls: str, red_w: dict[str, float], blue_w: dict[str, float]) -> float:
+    reds = normalize_numbers(red_balls)
+    blues = normalize_numbers(blue_balls)
+    score = 0.0
+    for n in reds:
+        score += red_w.get(n, 0.0)
+    blue_factor = 1.15 if lottery_type == "ssq" else 1.1
+    for n in blues:
+        score += blue_w.get(n, 0.0) * blue_factor
+    return score
 
 def evaluate_predictions(db: Session, lottery_type: str):
     records = (
@@ -495,7 +906,13 @@ def generate_predictions_for_cycle(db: Session, lottery_type: str, based_on_issu
     p = predictor.Predictor(db)
     result = p.predict_multi(lottery_type, count=count)
     if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
+        tail = ""
+        raw = result.get("raw_response")
+        if raw is not None:
+            tail = "；raw=" + str(raw)[:200]
+        if result.get("valid_count") is not None and result.get("want_count") is not None:
+            tail = f"；valid={result.get('valid_count')}/{result.get('want_count')}" + tail
+        raise HTTPException(status_code=500, detail=str(result.get("error") or "LLM failed") + tail)
     meta = result.get("meta") or {"used_llm": False}
     status_snapshot = {}
     try:
@@ -546,7 +963,7 @@ def generate_predictions_for_cycle(db: Session, lottery_type: str, based_on_issu
         db.refresh(rec)
     return created, meta
 
-def ensure_predictions_for_cycle(db: Session, lottery_type: str, min_count: int = 20):
+def ensure_predictions_for_cycle(db: Session, lottery_type: str, min_count: int = 20) -> bool:
     latest = (
         db.query(models.LotteryRecord)
         .filter_by(lottery_type=lottery_type)
@@ -554,7 +971,7 @@ def ensure_predictions_for_cycle(db: Session, lottery_type: str, min_count: int 
         .first()
     )
     if not latest:
-        return
+        return False
     existing = (
         db.query(models.PredictionRecord)
         .filter_by(lottery_type=lottery_type, based_on_issue=latest.issue)
@@ -570,15 +987,22 @@ def ensure_predictions_for_cycle(db: Session, lottery_type: str, min_count: int 
                 generate_predictions_for_cycle(db, lottery_type, based_on_issue=latest.issue, count=1)
         except Exception:
             pass
-        return
+        return True
     remaining = min_count - existing
     while remaining > 0:
-        batch = 2 if remaining >= 2 else 1
+        batch = min(5, remaining)
         try:
             generate_predictions_for_cycle(db, lottery_type, based_on_issue=latest.issue, count=batch)
         except Exception:
             break
         remaining -= batch
+    existing2 = (
+        db.query(models.PredictionRecord)
+        .filter_by(lottery_type=lottery_type, based_on_issue=latest.issue)
+        .filter(models.PredictionRecord.used_llm == True)
+        .count()
+    )
+    return existing2 >= min_count
 
 @app.get("/api/llm/status/{lottery_type}")
 def get_llm_status(lottery_type: str, db: Session = Depends(get_db)):
@@ -669,7 +1093,6 @@ async def smart_scrape_loop():
         try:
             now_cn = datetime.now(LOTTERY_TZ)
             for lt in ("ssq", "dlt"):
-                cfg = LOTTERY_SCHEDULE.get(lt)
                 lottery_name = "双色球" if lt == "ssq" else "大乐透"
                 
                 win = in_scrape_window(now_cn, lt)
@@ -678,7 +1101,13 @@ async def smart_scrape_loop():
                     continue
                     
                 win_start, win_end = win
-                if not (win_start <= now_cn <= win_end):
+                if now_cn < win_start:
+                    _auto_scrape_state.pop(lt, None)
+                    continue
+                if now_cn > win_end:
+                    st = _auto_scrape_state.get(lt)
+                    if st and not st.get("done") and st.get("win_start") == win_start:
+                        logger.error(f"[{lottery_name}] ❌ 抓取失败：抓取窗口已结束，未获取到新期数据")
                     _auto_scrape_state.pop(lt, None)
                     continue
                     
@@ -688,67 +1117,55 @@ async def smart_scrape_loop():
                     _auto_scrape_state[lt] = {"win_start": win_start, "baseline_issue": None, "done": False}
                     st = _auto_scrape_state[lt]
 
-                db = database.SessionLocal()
+                if st.get("done"):
+                    continue
+
                 try:
-                    if st.get("baseline_issue") is None:
-                        latest_before = (
+                    db = database.SessionLocal()
+                    try:
+                        if st.get("baseline_issue") is None:
+                            latest_before = (
+                                db.query(models.LotteryRecord)
+                                .filter_by(lottery_type=lt)
+                                .order_by(models.LotteryRecord.issue.desc())
+                                .first()
+                            )
+                            st["baseline_issue"] = latest_before.issue if latest_before else None
+                            if st["baseline_issue"]:
+                                logger.info(f"[{lottery_name}] 基准期号: {st['baseline_issue']}")
+                            else:
+                                logger.warning(f"[{lottery_name}] 暂无历史数据")
+
+                        s = scraper.LotteryScraper(db)
+                        if lt == "ssq":
+                            count = s.scrape_ssq(limit=1)
+                        else:
+                            count = s.scrape_dlt(limit=1)
+
+                        latest_after = (
                             db.query(models.LotteryRecord)
                             .filter_by(lottery_type=lt)
                             .order_by(models.LotteryRecord.issue.desc())
                             .first()
                         )
-                        st["baseline_issue"] = latest_before.issue if latest_before else None
-                        if st["baseline_issue"]:
-                            logger.info(f"[{lottery_name}] 基准期号: {st['baseline_issue']}")
+                        latest_issue = latest_after.issue if latest_after else None
+
+                        if latest_issue and latest_issue != st.get("baseline_issue"):
+                            logger.info(f"[{lottery_name}] ✅ 抓取成功！新期号: {latest_issue}")
+                            logger.info(f"[{lottery_name}] 开始生成推算...")
+                            evaluate_predictions(db, lt)
+                            ensure_predictions_for_cycle(db, lt, min_count=20)
+                            logger.info(f"[{lottery_name}] 推算生成完成，共20组")
+                            st["done"] = True
+                            _notify_latest_issue(lt)
                         else:
-                            logger.warning(f"[{lottery_name}] 暂无历史数据")
-
-                    if st.get("done"):
-                        continue
-
-                    # 执行抓取
-                    s = scraper.LotteryScraper(db)
-                    if lt == "ssq":
-                        count = s.scrape_ssq(limit=1)
-                    else:
-                        count = s.scrape_dlt(limit=1)
-
-                    latest_after = (
-                        db.query(models.LotteryRecord)
-                        .filter_by(lottery_type=lt)
-                        .order_by(models.LotteryRecord.issue.desc())
-                        .first()
-                    )
-                    latest_issue = latest_after.issue if latest_after else None
-                    
-                    # 检查是否抓到新数据
-                    if latest_issue and latest_issue != st.get("baseline_issue"):
-                        logger.info(f"[{lottery_name}] ✅ 抓取成功！新期号: {latest_issue}")
-                        logger.info(f"[{lottery_name}] 开始生成推算...")
-                        evaluate_predictions(db, lt)
-                        ensure_predictions_for_cycle(db, lt, min_count=20)
-                        logger.info(f"[{lottery_name}] 推算生成完成，共20组")
-                        st["done"] = True
-                        _notify_latest_issue(lt)
-                    else:
-                        # 检查是否即将超时
-                        remaining_minutes = (win_end - now_cn).total_seconds() / 60
-                        if remaining_minutes < 10 and count == 0:
-                            logger.warning(f"[{lottery_name}] 抓取窗口即将结束（剩余{remaining_minutes:.0f}分钟），但尚未获取到新期数据")
-                finally:
-                    db.close()
-                    
-            # 在窗口结束时检查是否有失败的任务
-            for lt in list(_auto_scrape_state.keys()):
-                st = _auto_scrape_state.get(lt)
-                if st and not st.get("done"):
-                    win_start = st.get("win_start")
-                    if win_start:
-                        win_end = win_start + timedelta(minutes=90)
-                        if now_cn > win_end:
-                            lottery_name = "双色球" if lt == "ssq" else "大乐透"
-                            logger.error(f"[{lottery_name}] ❌ 抓取失败：抓取窗口已结束，未获取到新期数据")
-                            _auto_scrape_state.pop(lt, None)
+                            remaining_minutes = (win_end - now_cn).total_seconds() / 60
+                            if remaining_minutes < 10 and count == 0:
+                                logger.warning(f"[{lottery_name}] 抓取窗口即将结束（剩余{remaining_minutes:.0f}分钟），但尚未获取到新期数据")
+                    finally:
+                        db.close()
+                except Exception as e:
+                    logger.error(f"[{lottery_name}] 智能抓取任务异常: {e}")
                             
         except Exception as e:
             logger.error(f"智能抓取循环异常: {e}")
@@ -794,8 +1211,6 @@ async def stream_latest(lottery_type: str, db: Session = Depends(get_db)):
 
 @app.on_event("startup")
 async def on_startup():
-    await asyncio.to_thread(ensure_default_llm_settings)
-
     def warm_scrape(lt: str):
         db = database.SessionLocal()
         try:
@@ -831,6 +1246,8 @@ def update_settings(settings: SettingsUpdate, request: Request, db: Session = De
     for key, value in payload.items():
         if value is None:
             continue
+        if key in ("llm_api_key", "llm_model") and isinstance(value, str) and value.strip() == "":
+            continue
         setting = db.query(models.AppSettings).filter_by(key=key).first()
         if setting:
             setting.value = value
@@ -859,8 +1276,23 @@ def test_llm(settings: SettingsUpdate, request: Request, db: Session = Depends(g
 
     t0 = time.monotonic()
     try:
-        base = (base_url or "https://api.siliconflow.cn/v1").rstrip("/")
-        url = f"{base}/chat/completions"
+        base = (base_url or "https://api.siliconflow.cn/v1").strip()
+        if not base:
+            base = "https://api.siliconflow.cn/v1"
+        base = base.rstrip("/")
+        parsed_base = urlparse(base)
+        path = (parsed_base.path or "").rstrip("/")
+        if path.endswith("/chat/completions") or "/chat/completions" in path:
+            url = base
+        else:
+            segs = [s for s in path.split("/") if s]
+            if segs and segs[-1] == "v1":
+                new_path = path + "/chat/completions"
+            elif "v1" in segs:
+                new_path = path + "/chat/completions"
+            else:
+                new_path = path + "/v1/chat/completions"
+            url = urlunparse(parsed_base._replace(path=new_path))
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "只回复 JSON：{\"ok\":true}"}],
@@ -901,6 +1333,261 @@ def change_admin_password(payload: AdminPasswordChange, request: Request, db: Se
     set_setting(db, "admin_password_hash", hash_password(payload.new_password))
     set_setting(db, "admin_password_changed", "1")
     return {"message": "密码修改成功"}
+
+@app.post("/api/admin/sync-time")
+def sync_server_time(request: Request, db: Session = Depends(get_db)):
+    require_admin_api(request, db)
+    steps = []
+
+    steps.append(_run_command(["date"]))
+    steps.append(_run_command(["date", "-u"]))
+
+    tz_ok = False
+    if _which("timedatectl"):
+        steps.append(_run_command(["timedatectl", "set-timezone", "Asia/Shanghai"]))
+        tz_ok = bool(steps[-1].get("ok"))
+    if not tz_ok:
+        steps.append(_run_command(["ln", "-sf", "/usr/share/zoneinfo/Asia/Shanghai", "/etc/localtime"]))
+        tz_ok = bool(steps[-1].get("ok"))
+        try:
+            with open("/etc/timezone", "w", encoding="utf-8") as f:
+                f.write("Asia/Shanghai\n")
+            steps.append({"cmd": "write /etc/timezone", "ok": True, "code": 0, "stdout": "", "stderr": ""})
+        except Exception as e:
+            steps.append({"cmd": "write /etc/timezone", "ok": False, "code": None, "stdout": "", "stderr": str(e)[:2000]})
+
+    if _which("timedatectl"):
+        steps.append(_run_command(["timedatectl", "set-ntp", "true"]))
+
+    if _which("systemctl"):
+        for svc in ("systemd-timesyncd", "chronyd", "chrony", "ntpd"):
+            steps.append(_run_command(["systemctl", "restart", svc]))
+
+    synced = False
+    if _which("chronyc"):
+        steps.append(_run_command(["chronyc", "-a", "makestep"], timeout=45))
+        synced = bool(steps[-1].get("ok"))
+    if not synced and _which("ntpdate"):
+        steps.append(_run_command(["ntpdate", "-u", "ntp.aliyun.com"], timeout=45))
+        synced = bool(steps[-1].get("ok"))
+    if not synced and _which("busybox"):
+        steps.append(_run_command(["busybox", "ntpd", "-q", "-n", "-p", "ntp.aliyun.com"], timeout=60))
+        synced = bool(steps[-1].get("ok"))
+    if not synced and _which("timedatectl"):
+        for _ in range(8):
+            probe = _run_command(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
+            steps.append(probe)
+            v = (probe.get("stdout") or "").strip().lower()
+            if v in ("yes", "true", "1"):
+                synced = True
+                break
+            time.sleep(1.0)
+
+    if _which("timedatectl"):
+        steps.append(_run_command(["timedatectl", "status"], timeout=20))
+    steps.append(_run_command(["date"]))
+    steps.append(_run_command(["date", "-u"]))
+
+    reason = []
+    if not tz_ok:
+        reason.append("时区设置失败（可能缺少权限）")
+    if not synced:
+        reason.append("时间同步失败（可能缺少权限/工具或网络）")
+
+    return {
+        "ok": bool(tz_ok) and bool(synced),
+        "timezone": "Asia/Shanghai",
+        "tz_ok": bool(tz_ok),
+        "synced": bool(synced),
+        "reason": "；".join(reason) if reason else "",
+        "steps": steps,
+    }
+
+@app.post("/api/admin/regenerate-predictions")
+def regenerate_predictions(request: Request, db: Session = Depends(get_db)):
+    """管理员手动触发重新推算"""
+    require_admin_api(request, db)
+    
+    try:
+        # 获取最新开奖记录
+        ssq_latest = db.query(models.LotteryRecord).filter(
+            models.LotteryRecord.lottery_type == "ssq"
+        ).order_by(models.LotteryRecord.issue.desc()).first()
+        
+        dlt_latest = db.query(models.LotteryRecord).filter(
+            models.LotteryRecord.lottery_type == "dlt"
+        ).order_by(models.LotteryRecord.issue.desc()).first()
+        
+        if not ssq_latest and not dlt_latest:
+            raise HTTPException(status_code=400, detail="暂无开奖数据，无法推算")
+        
+        # 清除现有推算记录
+        deleted_count = 0
+        if ssq_latest:
+            deleted = db.query(models.PredictionRecord).filter(
+                models.PredictionRecord.lottery_type == "ssq",
+                models.PredictionRecord.based_on_issue == ssq_latest.issue
+            ).delete()
+            deleted_count += deleted
+            
+        if dlt_latest:
+            deleted = db.query(models.PredictionRecord).filter(
+                models.PredictionRecord.lottery_type == "dlt",
+                models.PredictionRecord.based_on_issue == dlt_latest.issue
+            ).delete()
+            deleted_count += deleted
+            
+        db.commit()
+        
+        # 触发新的推算
+        results = []
+        
+        if ssq_latest:
+            created, meta = generate_predictions_for_cycle(db, "ssq", based_on_issue=ssq_latest.issue, count=20)
+            if not bool((meta or {}).get("used_llm")):
+                raise HTTPException(status_code=500, detail="推算未调用AI大模型")
+            model = (meta or {}).get("model") or ""
+            results.append(f"双色球: {len(created)}组" + (f" · {model}" if model else ""))
+                
+        if dlt_latest:
+            created, meta = generate_predictions_for_cycle(db, "dlt", based_on_issue=dlt_latest.issue, count=20)
+            if not bool((meta or {}).get("used_llm")):
+                raise HTTPException(status_code=500, detail="推算未调用AI大模型")
+            model = (meta or {}).get("model") or ""
+            results.append(f"大乐透: {len(created)}组" + (f" · {model}" if model else ""))
+        
+        message = f"已清除 {deleted_count} 条旧记录，重新生成推算：" + "，".join(results)
+        return {"message": message}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Regenerate predictions error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"重新推算失败: {str(e)}")
+
+@app.post("/admin/action/sync-time")
+def admin_action_sync_time(request: Request, db: Session = Depends(get_db)):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        data = sync_server_time(request, db)
+        ok = bool((data or {}).get("ok"))
+        if ok:
+            steps = (data or {}).get("steps") or []
+            last = steps[-4:] if isinstance(steps, list) else []
+            text = "校准成功：Asia/Shanghai 已生效，且已执行时间同步"
+            if last:
+                text += "\n\n" + json.dumps(last, ensure_ascii=False, indent=2)
+            request.session["admin_flash"] = {"kind": "msg", "text": text}
+        else:
+            reason = (data or {}).get("reason") or "执行失败"
+            steps = (data or {}).get("steps") or []
+            last = steps[-4:] if isinstance(steps, list) else []
+            text = "校准失败：" + str(reason)
+            if last:
+                text += "\n\n" + json.dumps(last, ensure_ascii=False, indent=2)
+            request.session["admin_flash"] = {"kind": "err", "text": text}
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "校准失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "校准失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/action/regenerate-predictions")
+def admin_action_regenerate_predictions(request: Request, db: Session = Depends(get_db)):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        data = regenerate_predictions(request, db)
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("message") or "")
+        request.session["admin_flash"] = {"kind": "msg", "text": "重新推算成功：" + message}
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "重新推算失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "重新推算失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/action/test-llm")
+def admin_action_test_llm(
+    request: Request,
+    llm_api_key: str = Form(""),
+    llm_base_url: str = Form(""),
+    llm_model: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        llm_api_key = (llm_api_key or "").strip()
+        llm_model = (llm_model or "").strip()
+        payload = SettingsUpdate(
+            llm_api_key=(llm_api_key if llm_api_key else None),
+            llm_base_url=(llm_base_url or ""),
+            llm_model=(llm_model if llm_model else None),
+        )
+        data = test_llm(payload, request, db)
+        model = ""
+        latency_ms = 0
+        if isinstance(data, dict):
+            model = str(data.get("model") or "")
+            try:
+                latency_ms = int(data.get("latency_ms") or 0)
+            except Exception:
+                latency_ms = 0
+        request.session["admin_flash"] = {"kind": "msg", "text": f"测试成功：{model} · {latency_ms}ms".strip()}
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "测试失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "测试失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/action/save-settings")
+def admin_action_save_settings(
+    request: Request,
+    llm_api_key: str = Form(""),
+    llm_base_url: str = Form(""),
+    llm_model: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        llm_api_key = (llm_api_key or "").strip()
+        llm_model = (llm_model or "").strip()
+        payload = SettingsUpdate(
+            llm_api_key=(llm_api_key if llm_api_key else None),
+            llm_base_url=llm_base_url or "",
+            llm_model=(llm_model if llm_model else None),
+        )
+        update_settings(payload, request, db)
+        request.session["admin_flash"] = {"kind": "msg", "text": "保存成功"}
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "保存失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "保存失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/action/change-password")
+def admin_action_change_password(
+    request: Request,
+    old_password: str = Form(""),
+    new_password: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        payload = AdminPasswordChange(old_password=old_password or "", new_password=new_password or "")
+        change_admin_password(payload, request, db)
+        request.session["admin_flash"] = {"kind": "msg", "text": "密码修改成功，请牢记新密码"}
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "修改失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "修改失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
 
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page():
@@ -964,7 +1651,7 @@ def admin_logout(request: Request):
 def admin_page(request: Request, db: Session = Depends(get_db)):
     if not is_admin_session(request, db):
         return RedirectResponse(url="/admin/login", status_code=303)
-    return """
+    html = """
 <!doctype html>
 <html lang="zh-CN">
   <head>
@@ -1004,48 +1691,56 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
             <p>该页面用于配置大模型 API（需先登录）。</p>
           </div>
           <div class="rt">
-            <button class="ghost" id="logout" title="退出后台">退出</button>
+            <form method="get" action="/admin/logout" style="margin:0">
+              <button type="submit" class="ghost" id="logout" title="退出后台">退出</button>
+            </form>
           </div>
         </div>
 
-        <div class="grid">
+        <form method="post" action="/admin/action/save-settings" style="margin: 0;">
+          <div class="grid">
+            <div>
+              <label>LLM API Key</label>
+              <input id="k" name="llm_api_key" type="password" placeholder="sk-..." />
+            </div>
+            <div>
+              <label>LLM Base URL（可选）</label>
+              <input id="b" name="llm_base_url" placeholder="https://api.siliconflow.cn/v1" />
+            </div>
+          </div>
+
           <div>
-            <label>LLM API Key</label>
-            <input id="k" type="password" placeholder="sk-..." />
+            <label>LLM 模型名</label>
+            <input id="m" name="llm_model" placeholder="deepseek-ai/DeepSeek-V3" />
+            <div class="hint">示范配置：<span class="mono">Base URL=https://api.siliconflow.cn/v1</span>，<span class="mono">Model=deepseek-ai/DeepSeek-V3</span></div>
           </div>
-          <div>
-            <label>LLM Base URL（可选）</label>
-            <input id="b" placeholder="https://api.siliconflow.cn/v1" />
+
+          <div class="row">
+            <button type="submit" class="ghost" id="test" formaction="/admin/action/test-llm">测试配置</button>
+            <button type="submit" class="primary" id="save" formaction="/admin/action/save-settings">保存</button>
+            <button type="submit" class="ghost" id="syncTime" formaction="/admin/action/sync-time" style="margin-left: auto;">校准时间(上海)</button>
+            <button type="submit" class="ghost" id="regenerate" formaction="/admin/action/regenerate-predictions">重新推算</button>
           </div>
-        </div>
-
-        <div>
-          <label>LLM 模型名</label>
-          <input id="m" placeholder="deepseek-ai/DeepSeek-R1" />
-          <div class="hint">示范配置：<span class="mono">Base URL=https://api.siliconflow.cn/v1</span>，<span class="mono">Model=deepseek-ai/DeepSeek-R1</span></div>
-        </div>
-
-        <div class="row">
-          <button class="ghost" id="test">测试配置</button>
-          <button class="primary" id="save">保存</button>
-        </div>
+        </form>
 
         <div class="msg" id="msg"></div>
         <div class="err" id="err"></div>
 
-        <div class="grid" style="margin-top: 18px;">
-          <div>
-            <label>原密码</label>
-            <input id="oldpw" type="password" autocomplete="current-password" />
+        <form method="post" action="/admin/action/change-password" style="margin: 0;">
+          <div class="grid" style="margin-top: 18px;">
+            <div>
+              <label>原密码</label>
+              <input id="oldpw" name="old_password" type="password" autocomplete="current-password" />
+            </div>
+            <div>
+              <label>新密码（至少 8 位）</label>
+              <input id="newpw" name="new_password" type="password" autocomplete="new-password" />
+            </div>
           </div>
-          <div>
-            <label>新密码（至少 8 位）</label>
-            <input id="newpw" type="password" autocomplete="new-password" />
+          <div class="row">
+            <button type="submit" class="primary" id="changepw">修改密码</button>
           </div>
-        </div>
-        <div class="row">
-          <button class="primary" id="changepw">修改密码</button>
-        </div>
+        </form>
 
         <div class="hint">
           默认账号：<span class="mono">admin</span> / <span class="mono">admin</span>（建议通过环境变量修改用户名：<span class="mono">ADMIN_USERNAME</span>；会话密钥：<span class="mono">SESSION_SECRET</span>）
@@ -1055,18 +1750,53 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
 
     <script>
       const $ = (id) => document.getElementById(id)
-      const msg = (t) => { $('msg').textContent = t; $('msg').style.display = 'block'; $('err').style.display = 'none'; }
-      const err = (t) => { $('err').textContent = t; $('err').style.display = 'block'; $('msg').style.display = 'none'; }
+      const showPanel = (kind, text) => {
+        try {
+          const el = $(kind)
+          const other = kind === 'msg' ? $('err') : $('msg')
+          if (!el || !other) {
+            alert(String(text || ''))
+            return
+          }
+          el.textContent = text
+          el.style.display = 'block'
+          other.style.display = 'none'
+          try {
+            if (typeof el.scrollIntoView === 'function') el.scrollIntoView()
+          } catch (e3) {}
+        } catch (e) {
+          try { alert(String(text || '')) } catch (e2) {}
+        }
+      }
+      const msg = (t) => showPanel('msg', t)
+      const err = (t) => showPanel('err', t)
+
+      async function pushNotice(title, body) {
+        try {
+          if (!('Notification' in window)) return
+          if (Notification.permission === 'granted') {
+            new Notification(title, { body })
+            return
+          }
+          if (Notification.permission === 'default') {
+            const perm = await Notification.requestPermission()
+            if (perm === 'granted') new Notification(title, { body })
+          }
+        } catch (e) {}
+      }
 
       async function loadSettings() {
         try {
-          const res = await fetch('/api/settings')
+          const res = await fetch('/api/settings', { credentials: 'same-origin' })
           const data = await res.json()
           if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status))
           $('k').value = data.llm_api_key || ''
           $('b').value = data.llm_base_url || ''
           $('m').value = data.llm_model || ''
-          msg('读取成功')
+          const hasFlash =
+            (($('msg') && $('msg').style.display === 'block' && ($('msg').textContent || '').trim()) ||
+             ($('err') && $('err').style.display === 'block' && ($('err').textContent || '').trim()))
+          if (!hasFlash) msg('读取成功')
         } catch (e) {
           err('读取失败：' + (e && e.message ? e.message : String(e)))
         }
@@ -1075,12 +1805,13 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
       async function testSettings() {
         try {
           const payload = {
-            llm_api_key: $('k').value || '',
             llm_base_url: $('b').value || '',
-            llm_model: $('m').value || ''
           }
+          if (($('k').value || '').trim()) payload.llm_api_key = $('k').value
+          if (($('m').value || '').trim()) payload.llm_model = $('m').value
           const res = await fetch('/api/admin/test-llm', {
             method: 'POST',
+            credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
           })
@@ -1095,12 +1826,13 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
       async function saveSettings() {
         try {
           const payload = {
-            llm_api_key: $('k').value || '',
             llm_base_url: $('b').value || '',
-            llm_model: $('m').value || ''
           }
+          if (($('k').value || '').trim()) payload.llm_api_key = $('k').value
+          if (($('m').value || '').trim()) payload.llm_model = $('m').value
           const res = await fetch('/api/settings', {
             method: 'POST',
+            credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
           })
@@ -1119,6 +1851,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
           const newpw = $('newpw').value || ''
           const res = await fetch('/api/admin/change-password', {
             method: 'POST',
+            credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ old_password: oldpw, new_password: newpw })
           })
@@ -1132,15 +1865,120 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
         }
       }
 
-      $('test').addEventListener('click', testSettings)
-      $('save').addEventListener('click', saveSettings)
-      $('changepw').addEventListener('click', changePassword)
-      $('logout').addEventListener('click', () => { window.location.href = '/admin/logout' })
+      async function regeneratePredictions() {
+        try {
+          const btn = $('regenerate')
+          btn.disabled = true
+          btn.textContent = '重新推算中...'
+          msg('正在重新推算，请稍候...')
+          const res = await fetch('/api/admin/regenerate-predictions', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }
+          })
+          const data = await res.json()
+          if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status))
+          const text = '重新推算成功：' + (data.message || '')
+          msg(text)
+          pushNotice('重新推算完成', data.message || '')
+        } catch (e) {
+          const text = '重新推算失败：' + (e && e.message ? e.message : String(e))
+          err(text)
+          pushNotice('重新推算失败', e && e.message ? e.message : String(e))
+        } finally {
+          const btn = $('regenerate')
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = '重新推算'
+          }
+        }
+      }
+
+      async function syncTime() {
+        try {
+          const btn = $('syncTime')
+          btn.disabled = true
+          btn.textContent = '校准中...'
+          msg('正在校准服务器时间，请稍候...')
+          const res = await fetch('/api/admin/sync-time', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }
+          })
+          const data = await res.json().catch(() => ({}))
+          if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status))
+          if (!data.ok) {
+            const reason = data.reason || '执行失败'
+            const last = Array.isArray(data.steps) ? data.steps.slice(-4) : []
+            err('校准失败：' + reason + (last.length ? ('\n\n' + JSON.stringify(last, null, 2)) : ''))
+            pushNotice('时间校准失败', reason)
+            return
+          }
+          const last = Array.isArray(data.steps) ? data.steps.slice(-4) : []
+          msg('校准成功：Asia/Shanghai 已生效，且已执行时间同步' + (last.length ? ('\n\n' + JSON.stringify(last, null, 2)) : ''))
+          pushNotice('时间校准完成', '已设置为 Asia/Shanghai，并执行时间同步')
+        } catch (e) {
+          const text = '校准失败：' + (e && e.message ? e.message : String(e))
+          err(text)
+          pushNotice('时间校准失败', e && e.message ? e.message : String(e))
+        } finally {
+          const btn = $('syncTime')
+          if (btn) {
+            btn.disabled = false
+            btn.textContent = '校准时间(上海)'
+          }
+        }
+      }
+
+      const bindClick = (id, fn) => {
+        const el = $(id)
+        if (!el) return
+        try {
+          if ((el.tagName || '').toUpperCase() === 'BUTTON') {
+            const t = String(el.getAttribute('type') || '').toLowerCase()
+            if (t === 'submit') return
+          }
+        } catch (e) {}
+        el.addEventListener('click', (evt) => {
+          try { evt.preventDefault() } catch (e) {}
+          try { evt.stopPropagation() } catch (e) {}
+          fn(evt)
+        })
+      }
+      bindClick('test', () => testSettings())
+      bindClick('save', () => saveSettings())
+      bindClick('changepw', () => changePassword())
+      bindClick('syncTime', () => syncTime())
+      bindClick('regenerate', () => regeneratePredictions())
+      bindClick('logout', () => { window.location.href = '/admin/logout' })
       loadSettings()
     </script>
   </body>
 </html>
     """
+    try:
+        import html as _html
+        flash = request.session.pop("admin_flash", None)
+        if isinstance(flash, dict):
+            kind = flash.get("kind")
+            text = flash.get("text")
+            if isinstance(text, str) and text.strip():
+                safe_text = _html.escape(text)
+                if kind == "msg":
+                    html = html.replace(
+                        '<div class="msg" id="msg"></div>',
+                        f'<div class="msg" id="msg" style="display:block; white-space: pre-wrap">{safe_text}</div>',
+                        1,
+                    )
+                elif kind == "err":
+                    html = html.replace(
+                        '<div class="err" id="err"></div>',
+                        f'<div class="err" id="err" style="display:block">{safe_text}</div>',
+                        1,
+                    )
+    except Exception:
+        pass
+    return html
 
 # Serve Frontend Static Files
 frontend_dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
@@ -1148,3 +1986,7 @@ if os.path.exists(frontend_dist):
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="static")
 else:
     print(f"Frontend dist not found at {frontend_dist}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8888)

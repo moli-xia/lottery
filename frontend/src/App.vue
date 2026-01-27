@@ -9,7 +9,7 @@
           </div>
         </div>
         <div class="mt-2 text-sm text-slate-300">爬取历史开奖数据，支持自定义大模型 API，生成下一期号码建议</div>
-        <div class="mt-2 text-xs text-slate-400">提示：彩票具有随机性，内容仅供娱乐与研究参考</div>
+        <div class="mt-2 text-xs text-slate-400">提示：彩票具有随机性，内容仅供娱乐与研究参考 <!-- v2.0.1 --></div>
       </div>
 
       <div class="rounded-2xl bg-white/5 backdrop-blur border border-white/10 shadow-xl">

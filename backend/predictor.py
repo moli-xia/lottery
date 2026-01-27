@@ -6,6 +6,7 @@ import re
 import random
 import time
 import requests
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +49,23 @@ class Predictor:
             return {"error": "LLM not configured"}
 
         llm = self._predict_with_llm(lottery_type, cfg, history, api_key, base_url, model, count)
-        if llm and "error" not in llm:
-            validated = self._validate_predictions(cfg, llm.get("predictions", []), count)
-            if validated:
-                return {
-                    "analysis": llm.get("analysis", ""),
-                    "predictions": validated,
-                    "meta": llm.get("meta") or {"used_llm": True, "model": model, "base_url": base_url},
-                }
-        return {"error": "LLM failed"}
+        if not llm:
+            return {"error": "LLM failed: empty response"}
+        if "error" in llm:
+            return llm
+        validated = self._validate_predictions(cfg, llm.get("predictions", []), count)
+        if len(validated) < count:
+            return {
+                "error": "LLM returned insufficient valid predictions",
+                "valid_count": len(validated),
+                "want_count": count,
+                "raw_response": (llm.get("predictions") or llm) if isinstance(llm, dict) else str(llm),
+            }
+        return {
+            "analysis": llm.get("analysis", ""),
+            "predictions": validated,
+            "meta": llm.get("meta") or {"used_llm": True, "model": model, "base_url": base_url},
+        }
 
     def _lottery_config(self, lottery_type: str):
         if lottery_type == "ssq":
@@ -131,8 +140,23 @@ class Predictor:
         t0 = time.monotonic()
         try:
             max_tokens = min(1600, 200 + (count * 80))
-            base = (base_url or "https://api.siliconflow.cn/v1").rstrip("/")
-            url = f"{base}/chat/completions"
+            base = (base_url or "https://api.siliconflow.cn/v1").strip()
+            if not base:
+                base = "https://api.siliconflow.cn/v1"
+            base = base.rstrip("/")
+            parsed_base = urlparse(base)
+            path = (parsed_base.path or "").rstrip("/")
+            if path.endswith("/chat/completions") or "/chat/completions" in path:
+                url = base
+            else:
+                segs = [s for s in path.split("/") if s]
+                if segs and segs[-1] == "v1":
+                    new_path = path + "/chat/completions"
+                elif "v1" in segs:
+                    new_path = path + "/chat/completions"
+                else:
+                    new_path = path + "/v1/chat/completions"
+                url = urlunparse(parsed_base._replace(path=new_path))
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -144,7 +168,7 @@ class Predictor:
             last_exc = None
             for attempt in range(3):
                 try:
-                    r = requests.post(url, headers=headers, json=payload, timeout=(15, 300))
+                    r = requests.post(url, headers=headers, json=payload, timeout=(30, 600))
                     logger.info(f"LLM Call Success: attempt={attempt + 1}, status={r.status_code}")
                     break
                 except (requests.Timeout, requests.ConnectionError) as e:
@@ -180,7 +204,7 @@ class Predictor:
             meta = {
                 "used_llm": True,
                 "model": model,
-                "base_url": base_url,
+                "base_url": base_url or "https://api.siliconflow.cn/v1",
                 "latency_ms": latency_ms,
             }
             if isinstance(parsed, dict):
@@ -195,27 +219,63 @@ class Predictor:
         seen = set()
         out = []
         for item in preds or []:
-            reds = item.get("red_balls") or []
-            blues = item.get("blue_balls") or []
+            if not isinstance(item, dict):
+                continue
+            reds = (
+                item.get("red_balls")
+                if item.get("red_balls") is not None
+                else item.get("reds") if item.get("reds") is not None else item.get("red")
+            )
+            blues = (
+                item.get("blue_balls")
+                if item.get("blue_balls") is not None
+                else item.get("blues") if item.get("blues") is not None else item.get("blue")
+            )
+            if isinstance(reds, str):
+                reds = [x.strip() for x in re.split(r"[,\s]+", reds) if x.strip()]
+            if isinstance(blues, str):
+                blues = [x.strip() for x in re.split(r"[,\s]+", blues) if x.strip()]
             if not isinstance(reds, list) or not isinstance(blues, list):
                 continue
             reds_i = []
             blues_i = []
             ok = True
             for x in reds:
-                if not isinstance(x, str) or not x.isdigit():
+                if isinstance(x, int):
+                    v = x
+                elif isinstance(x, str):
+                    xs = x.strip()
+                    if not xs:
+                        ok = False
+                        break
+                    if xs.isdigit():
+                        v = int(xs)
+                    else:
+                        ok = False
+                        break
+                else:
                     ok = False
                     break
-                v = int(x)
                 if v < 1 or v > cfg["red_max"]:
                     ok = False
                     break
                 reds_i.append(v)
             for x in blues:
-                if not isinstance(x, str) or not x.isdigit():
+                if isinstance(x, int):
+                    v = x
+                elif isinstance(x, str):
+                    xs = x.strip()
+                    if not xs:
+                        ok = False
+                        break
+                    if xs.isdigit():
+                        v = int(xs)
+                    else:
+                        ok = False
+                        break
+                else:
                     ok = False
                     break
-                v = int(x)
                 if v < 1 or v > cfg["blue_max"]:
                     ok = False
                     break
