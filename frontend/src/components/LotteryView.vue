@@ -157,13 +157,18 @@
                 <span
                   v-for="(n, i) in splitNums(bestPredictionThisIssue.red_balls)"
                   :key="`bp-r-${i}-${n}`"
-                  class="w-8 h-8 rounded-full bg-rose-500/30 text-rose-200 flex items-center justify-center text-sm font-extrabold"
+                  class="w-8 h-8 rounded-full flex items-center justify-center text-sm font-extrabold"
+                  :class="isHit(n, bestPredictionThisIssue.actual_red_balls) ? 'bg-gradient-to-br from-rose-500 to-red-600 text-white' : 'bg-rose-500/30 text-rose-200'"
                 >{{ n }}</span>
                 <span
                   v-for="(n, i) in splitNums(bestPredictionThisIssue.blue_balls)"
                   :key="`bp-b-${i}-${n}`"
-                  class="w-8 h-8 rounded-full bg-sky-500/30 text-sky-200 flex items-center justify-center text-sm font-extrabold"
+                  class="w-8 h-8 rounded-full flex items-center justify-center text-sm font-extrabold"
+                  :class="isHit(n, bestPredictionThisIssue.actual_blue_balls) ? 'bg-gradient-to-br from-sky-500 to-blue-600 text-white' : 'bg-sky-500/30 text-sky-200'"
                 >{{ n }}</span>
+              </div>
+              <div class="mt-3 text-xs" :class="groupsGe3ThisIssue.count > 0 ? 'text-slate-200' : 'text-slate-400'">
+                本期统计：命中 ≥3 球共 {{ groupsGe3ThisIssue.count }} 组<span v-if="groupsGe3ThisIssue.count > 0">，分别为第 {{ groupsGe3ThisIssue.groups.join('、') }} 组</span>
               </div>
             </div>
           </div>
@@ -568,6 +573,20 @@ const bestPredictionThisIssue = computed(() => {
   const best = preds[bestIdx]
   const group = Number.isFinite(best?.sequence) ? best.sequence + 1 : bestIdx + 1
   return best ? { ...best, group } : null
+})
+
+const groupsGe3ThisIssue = computed(() => {
+  const preds = Array.isArray(hitStats.value?.recent_predictions) ? hitStats.value.recent_predictions : []
+  const groups = []
+  for (let i = 0; i < preds.length; i += 1) {
+    const p = preds[i]
+    const hits = Number(p?.total_hits || 0)
+    if (hits < 3) continue
+    const group = Number.isFinite(p?.sequence) ? p.sequence + 1 : i + 1
+    groups.push(group)
+  }
+  groups.sort((a, b) => a - b)
+  return { count: groups.length, groups }
 })
 
 const toggleHitDetails = () => {

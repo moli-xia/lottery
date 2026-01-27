@@ -50,3 +50,19 @@ class PredictionRecord(Base):
     red_hits = Column(Integer, nullable=True)
     blue_hits = Column(Integer, nullable=True)
     total_hits = Column(Integer, nullable=True)
+
+class AiGenerationLog(Base):
+    __tablename__ = "ai_generation_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    lottery_type = Column(String, index=True)
+    based_on_issue = Column(String, index=True)
+
+    llm_model = Column(String, nullable=True)
+    llm_base_url = Column(String, nullable=True)
+    llm_latency_ms = Column(Integer, nullable=True)
+
+    prompt = Column(Text, nullable=True)
+    raw_content = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

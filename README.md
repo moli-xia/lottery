@@ -22,12 +22,12 @@ docker pull superneed/lottery:latest
 ### 2) 运行容器（带数据持久化）
 
 ```bash
-touch lottery.db
+mkdir -p data
 
 docker run -d \
   --name lottery \
   -p 8888:8888 \
-  -v "$(pwd)/lottery.db:/app/lottery.db" \
+  -v "$(pwd)/data:/app/data" \
   -e TZ=Asia/Shanghai \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=admin \
@@ -63,7 +63,7 @@ docker rm -f lottery
 docker run -d \
   --name lottery \
   -p 8888:8888 \
-  -v "$(pwd)/lottery.db:/app/lottery.db" \
+  -v "$(pwd)/data:/app/data" \
   -e TZ=Asia/Shanghai \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=admin \
@@ -130,6 +130,8 @@ npm run dev
 ## 配置项（环境变量）
 
 - `TZ`：时区（默认 `Asia/Shanghai`）
+- `DB_PATH`：SQLite 文件路径（默认 `/app/data/lottery.db`，容器内建议挂载 `/app/data` 目录持久化）
+- `DATABASE_URL`：数据库连接串（优先级高于 `DB_PATH`）
 - `ADMIN_USERNAME`：后台用户名（默认 `admin`）
 - `ADMIN_PASSWORD`：后台初始密码（默认 `admin`，首次修改密码后以数据库内保存为准）
 - `SESSION_SECRET`：后台会话密钥（默认 `dev-secret`，生产环境务必设置为随机值）

@@ -65,6 +65,8 @@ class Predictor:
             "analysis": llm.get("analysis", ""),
             "predictions": validated,
             "meta": llm.get("meta") or {"used_llm": True, "model": model, "base_url": base_url},
+            "prompt": llm.get("_prompt") if isinstance(llm, dict) else None,
+            "raw_content": llm.get("_raw_content") if isinstance(llm, dict) else None,
         }
 
     def _lottery_config(self, lottery_type: str):
@@ -208,6 +210,8 @@ class Predictor:
                 "latency_ms": latency_ms,
             }
             if isinstance(parsed, dict):
+                parsed["_prompt"] = prompt
+                parsed["_raw_content"] = content
                 parsed["meta"] = parsed.get("meta") or meta
                 return parsed
             return {"error": "Invalid LLM response", "raw_response": content}

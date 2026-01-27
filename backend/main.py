@@ -914,6 +914,27 @@ def generate_predictions_for_cycle(db: Session, lottery_type: str, based_on_issu
             tail = f"；valid={result.get('valid_count')}/{result.get('want_count')}" + tail
         raise HTTPException(status_code=500, detail=str(result.get("error") or "LLM failed") + tail)
     meta = result.get("meta") or {"used_llm": False}
+    try:
+        prompt = result.get("prompt")
+        raw_content = result.get("raw_content")
+        if prompt or raw_content:
+            db.add(
+                models.AiGenerationLog(
+                    lottery_type=lottery_type,
+                    based_on_issue=based_on_issue,
+                    llm_model=meta.get("model"),
+                    llm_base_url=meta.get("base_url"),
+                    llm_latency_ms=meta.get("latency_ms"),
+                    prompt=prompt,
+                    raw_content=raw_content,
+                )
+            )
+            db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     status_snapshot = {}
     try:
         status_snapshot = {

@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
 
 # Set timezone
 ENV TZ=Asia/Shanghai
+ENV DB_PATH=/app/data/lottery.db
+
+RUN mkdir -p /app/data
 
 # Copy requirements
 COPY backend/requirements.txt ./backend/
