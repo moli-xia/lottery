@@ -10,6 +10,7 @@ from typing import Optional
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, urlunparse
+from email.utils import parsedate_to_datetime
 import asyncio
 import base64
 import hashlib
@@ -45,6 +46,29 @@ import predictor
 logger = logging.getLogger(__name__)
 
 _llm_status: dict[str, dict] = {"ssq": {}, "dlt": {}}
+_time_offset_seconds: int = 0
+_time_offset_source: str = ""
+_time_offset_updated_at: Optional[datetime] = None
+
+def _load_time_offset_from_db(db: Session):
+    global _time_offset_seconds, _time_offset_source, _time_offset_updated_at
+    raw = get_setting(db, "time_offset_seconds")
+    try:
+        _time_offset_seconds = int(str(raw).strip()) if raw is not None else 0
+    except Exception:
+        _time_offset_seconds = 0
+    _time_offset_source = (get_setting(db, "time_offset_source") or "").strip()
+    ts = (get_setting(db, "time_offset_updated_at") or "").strip()
+    try:
+        _time_offset_updated_at = datetime.fromisoformat(ts) if ts else None
+    except Exception:
+        _time_offset_updated_at = None
+
+def now_cn() -> datetime:
+    base = datetime.now(LOTTERY_TZ)
+    if _time_offset_seconds:
+        return base + timedelta(seconds=_time_offset_seconds)
+    return base
 
 def _dt_to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
@@ -1083,6 +1107,10 @@ LOTTERY_SCHEDULE = {
     "ssq": {"days": {1, 3, 6}, "draw_time": dtime(21, 15), "delay_min": 8},
     "dlt": {"days": {0, 2, 5}, "draw_time": dtime(21, 25), "delay_min": 8},
 }
+try:
+    SCRAPE_WINDOW_MINUTES = int(os.getenv("SCRAPE_WINDOW_MINUTES", "360"))
+except Exception:
+    SCRAPE_WINDOW_MINUTES = 360
 _auto_scrape_state: dict[str, dict] = {}
 _latest_issue_events: dict[str, asyncio.Event] = {"ssq": asyncio.Event(), "dlt": asyncio.Event()}
 
@@ -1093,7 +1121,7 @@ def in_scrape_window(now_cn: datetime, lottery_type: str) -> Optional[tuple[date
     if now_cn.weekday() not in cfg["days"]:
         return None
     base = datetime.combine(now_cn.date(), cfg["draw_time"], tzinfo=LOTTERY_TZ) + timedelta(minutes=cfg["delay_min"])
-    return (base, base + timedelta(minutes=90))
+    return (base, base + timedelta(minutes=SCRAPE_WINDOW_MINUTES))
 
 def _notify_latest_issue(lottery_type: str):
     ev = _latest_issue_events.get(lottery_type)
@@ -1112,7 +1140,7 @@ async def smart_scrape_loop():
     logger.info("智能抓取循环已启动 - 将根据开奖时间自动抓取数据")
     while True:
         try:
-            now_cn = datetime.now(LOTTERY_TZ)
+            now_cn = now_cn()
             for lt in ("ssq", "dlt"):
                 lottery_name = "双色球" if lt == "ssq" else "大乐透"
                 
@@ -1232,6 +1260,15 @@ async def stream_latest(lottery_type: str, db: Session = Depends(get_db)):
 
 @app.on_event("startup")
 async def on_startup():
+    def init_time_offset():
+        db = database.SessionLocal()
+        try:
+            _load_time_offset_from_db(db)
+        finally:
+            db.close()
+
+    await asyncio.to_thread(init_time_offset)
+
     def warm_scrape(lt: str):
         db = database.SessionLocal()
         try:
@@ -1359,67 +1396,61 @@ def change_admin_password(payload: AdminPasswordChange, request: Request, db: Se
 def sync_server_time(request: Request, db: Session = Depends(get_db)):
     require_admin_api(request, db)
     steps = []
+    local_utc = datetime.now(timezone.utc)
+    steps.append({"cmd": "local_utc", "ok": True, "stdout": local_utc.isoformat(), "stderr": "", "code": 0})
+    steps.append({"cmd": "local_cn", "ok": True, "stdout": local_utc.astimezone(LOTTERY_TZ).isoformat(), "stderr": "", "code": 0})
 
-    steps.append(_run_command(["date"]))
-    steps.append(_run_command(["date", "-u"]))
-
-    tz_ok = False
-    if _which("timedatectl"):
-        steps.append(_run_command(["timedatectl", "set-timezone", "Asia/Shanghai"]))
-        tz_ok = bool(steps[-1].get("ok"))
-    if not tz_ok:
-        steps.append(_run_command(["ln", "-sf", "/usr/share/zoneinfo/Asia/Shanghai", "/etc/localtime"]))
-        tz_ok = bool(steps[-1].get("ok"))
+    urls = [
+        "https://www.baidu.com",
+        "https://www.qq.com",
+        "https://www.aliyun.com",
+        "https://www.cloudflare.com",
+    ]
+    net_utc = None
+    used_url = ""
+    last_err = ""
+    for url in urls:
         try:
-            with open("/etc/timezone", "w", encoding="utf-8") as f:
-                f.write("Asia/Shanghai\n")
-            steps.append({"cmd": "write /etc/timezone", "ok": True, "code": 0, "stdout": "", "stderr": ""})
+            r = requests.head(url, timeout=10, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+            date_hdr = (r.headers.get("Date") or r.headers.get("date") or "").strip()
+            if not date_hdr:
+                steps.append({"cmd": f"HEAD {url}", "ok": False, "stdout": "", "stderr": "missing Date header", "code": r.status_code})
+                continue
+            dt = parsedate_to_datetime(date_hdr)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            net_utc = dt.astimezone(timezone.utc)
+            used_url = url
+            steps.append({"cmd": f"HEAD {url}", "ok": True, "stdout": f"{date_hdr} -> {net_utc.isoformat()}", "stderr": "", "code": r.status_code})
+            break
         except Exception as e:
-            steps.append({"cmd": "write /etc/timezone", "ok": False, "code": None, "stdout": "", "stderr": str(e)[:2000]})
-
-    if _which("timedatectl"):
-        steps.append(_run_command(["timedatectl", "set-ntp", "true"]))
-
-    if _which("systemctl"):
-        for svc in ("systemd-timesyncd", "chronyd", "chrony", "ntpd"):
-            steps.append(_run_command(["systemctl", "restart", svc]))
-
-    synced = False
-    if _which("chronyc"):
-        steps.append(_run_command(["chronyc", "-a", "makestep"], timeout=45))
-        synced = bool(steps[-1].get("ok"))
-    if not synced and _which("ntpdate"):
-        steps.append(_run_command(["ntpdate", "-u", "ntp.aliyun.com"], timeout=45))
-        synced = bool(steps[-1].get("ok"))
-    if not synced and _which("busybox"):
-        steps.append(_run_command(["busybox", "ntpd", "-q", "-n", "-p", "ntp.aliyun.com"], timeout=60))
-        synced = bool(steps[-1].get("ok"))
-    if not synced and _which("timedatectl"):
-        for _ in range(8):
-            probe = _run_command(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
-            steps.append(probe)
-            v = (probe.get("stdout") or "").strip().lower()
-            if v in ("yes", "true", "1"):
-                synced = True
-                break
-            time.sleep(1.0)
-
-    if _which("timedatectl"):
-        steps.append(_run_command(["timedatectl", "status"], timeout=20))
-    steps.append(_run_command(["date"]))
-    steps.append(_run_command(["date", "-u"]))
+            last_err = str(e)
+            steps.append({"cmd": f"HEAD {url}", "ok": False, "stdout": "", "stderr": last_err[:2000], "code": None})
 
     reason = []
-    if not tz_ok:
-        reason.append("时区设置失败（可能缺少权限）")
-    if not synced:
-        reason.append("时间同步失败（可能缺少权限/工具或网络）")
+    tz_ok = True
+    synced = False
+    offset_seconds = 0
+    if net_utc is None:
+        reason.append("无法获取网络时间（需要可访问外网）")
+    else:
+        offset = (net_utc - datetime.now(timezone.utc)).total_seconds()
+        offset_seconds = int(round(offset))
+        set_setting(db, "time_offset_seconds", str(offset_seconds))
+        set_setting(db, "time_offset_source", used_url)
+        set_setting(db, "time_offset_updated_at", datetime.now(timezone.utc).isoformat())
+        _load_time_offset_from_db(db)
+        synced = True
+        steps.append({"cmd": "time_offset_seconds", "ok": True, "stdout": str(offset_seconds), "stderr": "", "code": 0})
+        steps.append({"cmd": "app_now_cn", "ok": True, "stdout": now_cn().isoformat(), "stderr": "", "code": 0})
 
     return {
         "ok": bool(tz_ok) and bool(synced),
         "timezone": "Asia/Shanghai",
         "tz_ok": bool(tz_ok),
         "synced": bool(synced),
+        "offset_seconds": offset_seconds,
+        "source": used_url,
         "reason": "；".join(reason) if reason else "",
         "steps": steps,
     }
@@ -1496,7 +1527,16 @@ def admin_action_sync_time(request: Request, db: Session = Depends(get_db)):
         if ok:
             steps = (data or {}).get("steps") or []
             last = steps[-4:] if isinstance(steps, list) else []
-            text = "校准成功：Asia/Shanghai 已生效，且已执行时间同步"
+            offset_seconds = (data or {}).get("offset_seconds")
+            source = (data or {}).get("source") or ""
+            extra = ""
+            try:
+                extra = f"{int(offset_seconds)}秒" if offset_seconds is not None else ""
+            except Exception:
+                extra = str(offset_seconds or "")
+            text = "校准成功：已记录与网络时间偏移" + (f" {extra}" if extra else "") + "（应用内生效，不修改系统时间）"
+            if source:
+                text += f"\n来源：{source}"
             if last:
                 text += "\n\n" + json.dumps(last, ensure_ascii=False, indent=2)
             request.session["admin_flash"] = {"kind": "msg", "text": text}
