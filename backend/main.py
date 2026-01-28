@@ -64,7 +64,7 @@ def _load_time_offset_from_db(db: Session):
     except Exception:
         _time_offset_updated_at = None
 
-def now_cn() -> datetime:
+def get_now_cn() -> datetime:
     base = datetime.now(LOTTERY_TZ)
     if _time_offset_seconds:
         return base + timedelta(seconds=_time_offset_seconds)
@@ -1140,7 +1140,7 @@ async def smart_scrape_loop():
     logger.info("智能抓取循环已启动 - 将根据开奖时间自动抓取数据")
     while True:
         try:
-            now_cn = now_cn()
+            now_cn = get_now_cn()
             for lt in ("ssq", "dlt"):
                 lottery_name = "双色球" if lt == "ssq" else "大乐透"
                 
@@ -1442,7 +1442,7 @@ def sync_server_time(request: Request, db: Session = Depends(get_db)):
         _load_time_offset_from_db(db)
         synced = True
         steps.append({"cmd": "time_offset_seconds", "ok": True, "stdout": str(offset_seconds), "stderr": "", "code": 0})
-        steps.append({"cmd": "app_now_cn", "ok": True, "stdout": now_cn().isoformat(), "stderr": "", "code": 0})
+        steps.append({"cmd": "app_now_cn", "ok": True, "stdout": get_now_cn().isoformat(), "stderr": "", "code": 0})
 
     return {
         "ok": bool(tz_ok) and bool(synced),
@@ -1752,6 +1752,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
             <p>该页面用于配置大模型 API（需先登录）。</p>
           </div>
           <div class="rt">
+            <a href="/" class="ghost" style="display:inline-flex; align-items:center; justify-content:center; padding: 10px 14px; border-radius: 12px; font-weight: 700; text-decoration:none;" target="_blank" rel="noopener noreferrer" title="打开前台首页">前台首页</a>
             <form method="get" action="/admin/logout" style="margin:0">
               <button type="submit" class="ghost" id="logout" title="退出后台">退出</button>
             </form>

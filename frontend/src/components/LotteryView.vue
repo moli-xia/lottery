@@ -64,7 +64,7 @@
       </div>
 
       <div v-else class="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4 text-slate-300">
-        {{ predictionsLoading ? '生成中…' : '暂无推算结果，等待自动抓取与生成' }}
+        {{ predictionsLoading ? '生成中…' : '暂无推算结果，请在后台配置大模型API' }}
       </div>
       <div v-if="predictionsError" class="text-rose-300 mt-3">{{ predictionsError }}</div>
       <button
@@ -429,6 +429,56 @@
           </tbody>
         </table>
       </div>
+    </div>
+
+    <div class="pt-6 border-t border-white/10">
+      <details class="group opacity-80">
+        <summary class="cursor-pointer list-none flex items-center justify-between gap-3 text-slate-400 hover:text-slate-300">
+          <div class="text-xs font-semibold">开奖时间与中奖规则（摘要）</div>
+          <div class="text-[11px] group-open:hidden">展开</div>
+          <div class="text-[11px] hidden group-open:block">收起</div>
+        </summary>
+        <div class="mt-3 space-y-3 text-xs text-slate-400 leading-relaxed">
+          <div class="space-y-1">
+            <div class="font-semibold text-slate-300">开奖时间（北京）</div>
+            <div>双色球：每周二 / 四 / 日 21:15</div>
+            <div>大乐透：每周一 / 三 / 六 21:25</div>
+          </div>
+          <div class="space-y-1">
+            <div class="font-semibold text-slate-300">号码规则</div>
+            <div>双色球：红球 6 个（01-33）+ 蓝球 1 个（01-16）</div>
+            <div>大乐透：前区 5 个（01-35）+ 后区 2 个（01-12）</div>
+          </div>
+          <div class="space-y-2">
+            <div class="font-semibold text-slate-300">双色球中奖等级（简表）</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
+              <div>一等奖：6+1</div>
+              <div>二等奖：6+0</div>
+              <div>三等奖：5+1</div>
+              <div>四等奖：5+0 或 4+1</div>
+              <div>五等奖：4+0 或 3+1</div>
+              <div>六等奖：2+1 或 1+1 或 0+1</div>
+            </div>
+          </div>
+          <div class="space-y-2">
+            <div class="font-semibold text-slate-300">大乐透中奖等级（简表）</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
+              <div>一等奖：5+2</div>
+              <div>二等奖：5+1</div>
+              <div>三等奖：5+0</div>
+              <div>四等奖：4+2</div>
+              <div>五等奖：4+1</div>
+              <div>六等奖：3+2</div>
+              <div>七等奖：4+0 或 3+1 或 2+2</div>
+              <div>八等奖：3+0 或 2+1 或 1+2 或 0+2</div>
+              <div>九等奖：2+0 或 1+1 或 0+1</div>
+            </div>
+          </div>
+          <div class="text-[11px] text-slate-500">
+            以上为常见规则摘要，具体以中国福利彩票 / 中国体育彩票官方公告为准。
+          </div>
+        </div>
+      </details>
     </div>
 
     <Teleport to="body">
