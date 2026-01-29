@@ -1463,16 +1463,15 @@ def update_settings(settings: SettingsUpdate, request: Request, db: Session = De
 def test_llm(settings: SettingsUpdate, request: Request, db: Session = Depends(get_db)):
     require_admin_api(request, db)
 
-    saved_api_key = get_setting(db, "llm_api_key") or ""
     saved_base_url = get_setting(db, "llm_base_url") or ""
     saved_model = get_setting(db, "llm_model") or ""
 
-    api_key = settings.llm_api_key if settings.llm_api_key is not None else saved_api_key
+    if settings.llm_api_key is None or not (settings.llm_api_key or "").strip():
+        raise HTTPException(status_code=400, detail="LLM API Key 为空")
+    api_key = settings.llm_api_key
     base_url = settings.llm_base_url if settings.llm_base_url is not None else saved_base_url
     model = settings.llm_model if settings.llm_model is not None else saved_model
 
-    if not api_key:
-        raise HTTPException(status_code=400, detail="LLM API Key 为空")
     if not model:
         raise HTTPException(status_code=400, detail="LLM 模型名为空")
 
@@ -1873,6 +1872,15 @@ def admin_action_restart_backend(request: Request, db: Session = Depends(get_db)
     if not is_admin_session(request, db):
         return RedirectResponse(url="/admin/login", status_code=303)
 
+    in_docker = False
+    try:
+        in_docker = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv") or bool(os.getenv("DOCKER"))
+    except Exception:
+        in_docker = False
+    if in_docker or os.getpid() == 1:
+        request.session["admin_flash"] = {"kind": "msg", "text": "已执行重载（Docker 环境不进行进程自重启）"}
+        return RedirectResponse(url="/admin", status_code=303)
+
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     port = 8888
     try:
@@ -2004,6 +2012,20 @@ except Exception:
 </html>
         """.strip()
     )
+
+
+@app.post("/api/admin/restart-backend")
+def api_admin_restart_backend(request: Request, db: Session = Depends(get_db)):
+    require_admin_api(request, db)
+    in_docker = False
+    try:
+        in_docker = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv") or bool(os.getenv("DOCKER"))
+    except Exception:
+        in_docker = False
+    if in_docker or os.getpid() == 1:
+        return {"ok": True, "mode": "reload"}
+    admin_action_restart_backend(request, db)
+    return {"ok": True, "mode": "restart"}
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
