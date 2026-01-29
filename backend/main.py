@@ -1429,7 +1429,14 @@ async def on_startup():
 def get_settings(request: Request, db: Session = Depends(get_db)):
     require_admin_api(request, db)
     settings = db.query(models.AppSettings).all()
-    return {s.key: s.value for s in settings if s.key.startswith("llm_")}
+    out = {}
+    for s in settings:
+        if not (s.key or "").startswith("llm_"):
+            continue
+        if s.key == "llm_api_key":
+            continue
+        out[s.key] = s.value
+    return out
 
 @app.post("/api/settings")
 def update_settings(settings: SettingsUpdate, request: Request, db: Session = Depends(get_db)):
@@ -2246,7 +2253,10 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
           const res = await fetch('/api/settings', { credentials: 'same-origin' })
           const data = await res.json()
           if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status))
-          $('k').value = data.llm_api_key || ''
+          $('k').value = ''
+          try {
+            $('k').placeholder = '不会回显，留空表示不修改'
+          } catch (e) {}
           $('b').value = data.llm_base_url || ''
           $('m').value = data.llm_model || ''
           const hasFlash =

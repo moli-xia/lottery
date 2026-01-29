@@ -33,6 +33,8 @@ COPY backend ./backend
 # Copy frontend assets from builder
 COPY --from=builder /app/frontend/dist ./frontend/dist
 
+RUN find /app -maxdepth 3 -name "*.db" -delete || true
+
 # Expose port
 EXPOSE 8888
 
