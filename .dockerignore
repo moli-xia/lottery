@@ -16,6 +16,8 @@ backend/backend.log
 backend/backend_new.log
 data/
 lottery.db
+*.db
+**/*.db
 uvicorn-*.log
 uvicorn-*.pid
 frontend/dist

@@ -41,11 +41,15 @@ docker run -d \
 
 ### 3) 在后台配置 LLM
 
+> **🔒 安全提示**：Docker 镜像不包含任何 API 密钥。首次部署后，您需要通过后台配置您的 LLM API Key。
+
 进入 `/admin` 后可配置：
 
-- LLM API Key（必填）
+- LLM API Key（必填，首次使用必须配置）
 - LLM Base URL（可选，默认 `https://api.siliconflow.cn/v1`）
 - LLM 模型名（默认 `deepseek-ai/DeepSeek-R1`）
+
+配置保存后，数据持久化到挂载的 `/app/data` 目录，重启容器不会丢失。
 
 ### 常用运维命令
 

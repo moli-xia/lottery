@@ -201,6 +201,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Auto-initialize historical data on startup
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时自动初始化历史数据"""
+    logger.info("=" * 60)
+    logger.info("应用启动：开始检查数据库状态...")
+    
+    db = database.SessionLocal()
+    try:
+        # 加载时间偏移设置
+        _load_time_offset_from_db(db)
+        
+        # 检查双色球数据
+        ssq_count = db.query(models.LotteryRecord).filter_by(lottery_type='ssq').count()
+        if ssq_count == 0:
+            logger.info("⏳ 检测到双色球数据为空，开始自动抓取最近100期历史数据...")
+            try:
+                sc = scraper.LotteryScraper(db)
+                result = sc.scrape_ssq(limit=100, upsert=False)
+                logger.info(f"✅ 双色球数据初始化完成：新增 {result['added']} 条记录")
+            except Exception as e:
+                logger.error(f"❌ 双色球数据初始化失败: {e}")
+        else:
+            logger.info(f"✓ 双色球数据已存在（{ssq_count}条记录），跳过初始化")
+        
+        # 检查大乐透数据
+        dlt_count = db.query(models.LotteryRecord).filter_by(lottery_type='dlt').count()
+        if dlt_count == 0:
+            logger.info("⏳ 检测到大乐透数据为空，开始自动抓取最近100期历史数据...")
+            try:
+                sc = scraper.LotteryScraper(db)
+                result = sc.scrape_dlt(limit=100, upsert=False)
+                logger.info(f"✅ 大乐透数据初始化完成：新增 {result['added']} 条记录")
+            except Exception as e:
+                logger.error(f"❌ 大乐透数据初始化失败: {e}")
+        else:
+            logger.info(f"✓ 大乐透数据已存在（{dlt_count}条记录），跳过初始化")
+        
+        logger.info("=" * 60)
+        
+    except Exception as e:
+        logger.error(f"启动初始化过程出错: {e}")
+    finally:
+        db.close()
+    
+    # 预热抓取（获取最新5期数据）
+    def warm_scrape(lt: str):
+        db_warm = database.SessionLocal()
+        try:
+            sc = scraper.LotteryScraper(db_warm)
+            func = sc.scrape_ssq if lt == "ssq" else sc.scrape_dlt
+            func(limit=5, upsert=True, want_issue=None)
+        finally:
+            db_warm.close()
+    
+    asyncio.create_task(asyncio.to_thread(warm_scrape, "ssq"))
+    asyncio.create_task(asyncio.to_thread(warm_scrape, "dlt"))
+    
+    # 启动智能抓取循环
+    asyncio.create_task(smart_scrape_loop())
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "dev-secret"),
@@ -606,6 +667,7 @@ def get_hit_stats(lottery_type: str, db: Session = Depends(get_db), cycles_limit
             "cycles": cycles,
             "cumulative_stats": cumulative_stats,
             "is_demo": True,
+            "demo_message": "当前显示的是示例数据。要查看真实AI命中率，请先在后台配置LLM API密钥，然后等待系统自动抓取新开奖数据并生成预测。",
         }
 
     def cycle_summary(preds: list[models.PredictionRecord]):
@@ -650,7 +712,9 @@ def get_hit_stats(lottery_type: str, db: Session = Depends(get_db), cycles_limit
 
     latest_eval_row = (
         db.query(models.PredictionRecord.actual_issue)
-        .filter_by(lottery_type=lottery_type, used_llm=True, evaluated=True)
+        .filter_by(lottery_type=lottery_type)
+        .filter(models.PredictionRecord.used_llm == True)
+        .filter(models.PredictionRecord.evaluated == True)
         .filter(models.PredictionRecord.actual_issue.isnot(None))
         .order_by(models.PredictionRecord.actual_issue.desc())
         .first()
@@ -996,6 +1060,50 @@ def score_prediction(lottery_type: str, red_balls: str, blue_balls: str, red_w: 
     for n in blues:
         score += blue_w.get(n, 0.0) * blue_factor
     return score
+
+
+def ensure_initial_predictions(db: Session):
+    """确保每个彩种至少有一期预测数据（在配置LLM后调用）"""
+    api_key = (get_setting(db, "llm_api_key") or "").strip()
+    if not api_key:
+        logger.info("跳过初始预测生成：LLM API密钥未配置")
+        return
+    
+    for lt in ["ssq", "dlt"]:
+        try:
+            lottery_name = "双色球" if lt == "ssq" else "大乐透"
+            latest = (
+                db.query(models.LotteryRecord)
+                .filter_by(lottery_type=lt)
+                .order_by(models.LotteryRecord.issue.desc())
+                .first()
+            )
+            
+            if not latest:
+                logger.info(f"[{lottery_name}] 跳过初始预测：暂无历史开奖数据")
+                continue
+                
+            # 检查是否已有基于最新期的LLM预测
+            existing_count = (
+                db.query(models.PredictionRecord)
+                .filter_by(lottery_type=lt, based_on_issue=latest.issue)
+                .filter(models.PredictionRecord.used_llm == True)
+                .count()
+            )
+            
+            if existing_count >= 20:
+                logger.info(f"[{lottery_name}] 已存在{existing_count}组预测，跳过初始生成")
+                continue
+            
+            logger.info(f"[{lottery_name}] 开始生成初始预测（基于期号：{latest.issue}）...")
+            success = ensure_predictions_for_cycle(db, lt, min_count=20)
+            if success:
+                logger.info(f"[{lottery_name}] ✅ 初始预测生成成功")
+            else:
+                logger.warning(f"[{lottery_name}] ⚠️ 初始预测生成未完成")
+                
+        except Exception as e:
+            logger.warning(f"[{lottery_name}] 初始预测生成失败: {e}")
 
 def evaluate_predictions(db: Session, lottery_type: str):
     records = (
@@ -1395,35 +1503,7 @@ async def stream_latest(lottery_type: str, db: Session = Depends(get_db)):
     }
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
-@app.on_event("startup")
-async def on_startup():
-    def init_time_offset():
-        db = database.SessionLocal()
-        try:
-            _load_time_offset_from_db(db)
-        finally:
-            db.close()
 
-    await asyncio.to_thread(init_time_offset)
-
-    def warm_scrape(lt: str):
-        db = database.SessionLocal()
-        try:
-            existing_count = db.query(models.LotteryRecord).filter_by(lottery_type=lt).count()
-            if existing_count < 100:
-                s = scraper.LotteryScraper(db)
-                if lt == "ssq":
-                    s.scrape_ssq(limit=100)
-                else:
-                    s.scrape_dlt(limit=100)
-            evaluate_predictions(db, lt)
-            ensure_predictions_for_cycle(db, lt, min_count=20)
-        finally:
-            db.close()
-
-    asyncio.create_task(asyncio.to_thread(warm_scrape, "ssq"))
-    asyncio.create_task(asyncio.to_thread(warm_scrape, "dlt"))
-    asyncio.create_task(smart_scrape_loop())
 
 @app.get("/api/settings")
 def get_settings(request: Request, db: Session = Depends(get_db)):
@@ -2318,7 +2398,14 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
       }
 
       async function saveSettings() {
+        const saveBtn = $('save')
+        const originalText = saveBtn ? saveBtn.textContent : '保存'
         try {
+          if (saveBtn) {
+            saveBtn.disabled = true
+            saveBtn.textContent = '保存中...'
+          }
+          
           const payload = {
             llm_base_url: $('b').value || '',
           }
@@ -2333,9 +2420,20 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
           const data = await res.json()
           if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status))
           await loadSettings()
-          msg('保存成功')
+          
+          const hasApiKey = ($('k').value || '').trim()
+          if (hasApiKey) {
+            msg('✅ 配置保存成功！AI预测将在下次开奖后自动生成。如需立即生成预测数据，请点击下方"重新推算"按钮。')
+          } else {
+            msg('保存成功')
+          }
         } catch (e) {
           err('保存失败：' + (e && e.message ? e.message : String(e)))
+        } finally {
+          if (saveBtn) {
+            saveBtn.disabled = false
+            saveBtn.textContent = originalText
+          }
         }
       }
 

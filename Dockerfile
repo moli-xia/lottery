@@ -33,7 +33,8 @@ COPY backend ./backend
 # Copy frontend assets from builder
 COPY --from=builder /app/frontend/dist ./frontend/dist
 
-RUN find /app -maxdepth 3 -name "*.db" -delete || true
+# Remove all database files to prevent sensitive data (API keys) from being in the image
+RUN find /app -name "*.db" -type f -delete || true
 
 # Expose port
 EXPOSE 8888

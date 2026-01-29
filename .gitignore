@@ -1,15 +1,56 @@
-*.log
-*.db
-*.sqlite
-*.sqlite3
-*.py[cod]
+# Python
 __pycache__/
-*.pid
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-.env
-.env.*
+# Virtual environments
+venv/
+ENV/
+env/
 
-frontend/node_modules/
-frontend/dist/
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
+# OS
 .DS_Store
+Thumbs.db
+
+# Data and logs
+data/
+*.db
+*.log
+
+# Node
+node_modules/
+package-lock.json
+
+# Build
+frontend/dist/
+*.pyc
+
+# Secrets
+.env
+*.pem
+*.key
