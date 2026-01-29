@@ -5,9 +5,17 @@
 **/*.pyd
 .git
 .env
+.env.*
+.envrc
+.python-version
+.idea
 .DS_Store
 .vscode
 backend/lottery.db
 backend/backend.log
 backend/backend_new.log
+data/
+lottery.db
+uvicorn-*.log
+uvicorn-*.pid
 frontend/dist
