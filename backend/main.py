@@ -1463,17 +1463,23 @@ def update_settings(settings: SettingsUpdate, request: Request, db: Session = De
 def test_llm(settings: SettingsUpdate, request: Request, db: Session = Depends(get_db)):
     require_admin_api(request, db)
 
+    saved_api_key = (get_setting(db, "llm_api_key") or "").strip()
     saved_base_url = get_setting(db, "llm_base_url") or ""
     saved_model = get_setting(db, "llm_model") or ""
 
-    if settings.llm_api_key is None or not (settings.llm_api_key or "").strip():
-        raise HTTPException(status_code=400, detail="LLM API Key 为空")
-    api_key = settings.llm_api_key
-    base_url = settings.llm_base_url if settings.llm_base_url is not None else saved_base_url
-    model = settings.llm_model if settings.llm_model is not None else saved_model
+    input_api_key = (settings.llm_api_key or "").strip() if settings.llm_api_key is not None else ""
+    api_key = input_api_key or saved_api_key
+
+    input_base_url = (settings.llm_base_url or "").strip() if settings.llm_base_url is not None else ""
+    base_url = input_base_url or (saved_base_url or "")
+
+    input_model = (settings.llm_model or "").strip() if settings.llm_model is not None else ""
+    model = input_model or (saved_model or "")
 
     if not model:
         raise HTTPException(status_code=400, detail="LLM 模型名为空")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="LLM API Key 为空")
 
     t0 = time.monotonic()
     try:
