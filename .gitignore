@@ -4,6 +4,7 @@
 *.sqlite3
 *.py[cod]
 __pycache__/
+*.pid
 
 .env
 .env.*

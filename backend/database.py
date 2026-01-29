@@ -2,6 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import os
+import shutil
 
 _env_url = os.getenv("DATABASE_URL")
 if _env_url:
@@ -20,6 +21,7 @@ else:
     db_path = os.getenv("DB_PATH")
     if not db_path:
         candidates = _candidate_db_paths()
+        canonical = candidates[0]
         existing: list[str] = []
         for p in candidates:
             try:
@@ -56,9 +58,22 @@ else:
                 return 0
 
         if existing:
-            db_path = max(existing, key=_db_score)
+            best = max(existing, key=_db_score)
+            best_score = _db_score(best)
+            canonical_score = _db_score(canonical) if canonical in existing else 0
+            try:
+                os.makedirs(os.path.dirname(canonical), exist_ok=True)
+            except Exception:
+                pass
+            if best != canonical and best_score > canonical_score:
+                try:
+                    shutil.copy2(best, canonical)
+                    db_path = canonical
+                except Exception:
+                    db_path = best
+            else:
+                db_path = canonical if canonical in existing else best
         else:
-            canonical = candidates[0]
             try:
                 os.makedirs(os.path.dirname(canonical), exist_ok=True)
             except Exception:

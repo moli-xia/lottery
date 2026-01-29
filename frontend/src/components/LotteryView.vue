@@ -167,6 +167,12 @@
                   :class="isHit(n, bestPredictionThisIssue.actual_blue_balls) ? 'bg-gradient-to-br from-sky-500 to-blue-600 text-white' : 'bg-sky-500/30 text-sky-200'"
                 >{{ n }}</span>
               </div>
+              <div
+                v-if="getPrizeInfo(bestPredictionThisIssue)"
+                class="mt-2 inline-flex text-[11px] px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-500/30"
+              >
+                {{ getPrizeInfo(bestPredictionThisIssue).tier }} · {{ getPrizeInfo(bestPredictionThisIssue).amount }}
+              </div>
               <div class="mt-3 text-xs" :class="groupsGe3ThisIssue.count > 0 ? 'text-slate-200' : 'text-slate-400'">
                 本期统计：命中 ≥3 球共 {{ groupsGe3ThisIssue.count }} 组<span v-if="groupsGe3ThisIssue.count > 0">，分别为第 {{ groupsGe3ThisIssue.groups.join('、') }} 组</span>
               </div>
@@ -198,8 +204,16 @@
           >
             <div class="flex items-center justify-between mb-2">
               <div class="text-sm font-bold text-slate-100">第 {{ (pred.sequence ?? idx) + 1 }} 组</div>
-              <div class="text-xs px-2 py-1 rounded-full" :class="getHitClass(pred.total_hits || 0)">
-                命中 {{ pred.total_hits || 0 }} 个
+              <div class="flex flex-col items-end gap-1">
+                <div class="text-xs px-2 py-1 rounded-full" :class="getHitClass(pred.total_hits || 0)">
+                  命中 {{ pred.total_hits || 0 }} 个
+                </div>
+                <div
+                  v-if="getPrizeInfo(pred)"
+                  class="text-[11px] px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-500/30"
+                >
+                  {{ getPrizeInfo(pred).tier }} · {{ getPrizeInfo(pred).amount }}
+                </div>
               </div>
             </div>
             <div class="text-xs text-slate-400 mb-2">预测号码</div>
@@ -535,6 +549,7 @@ const hitStats = ref({
 })
 const showAllHitDetails = ref(false)
 let latestPollTimer = null
+let latestFallbackTimer = null
 const showToTopButton = ref(false)
 const hasUserScrolled = ref(false)
 let latestStream = null
@@ -608,6 +623,39 @@ const getHitClass = (totalHits) => {
   return 'bg-slate-500/50 text-slate-300'
 }
 
+const getPrizeInfo = (pred) => {
+  const redHits = Number(pred?.red_hits || 0)
+  const blueHits = Number(pred?.blue_hits || 0)
+  if (props.type === 'ssq') {
+    if (redHits === 6 && blueHits === 1) return { tier: '一等奖', amount: '浮动（封顶500万/1000万）' }
+    if (redHits === 6 && blueHits === 0) return { tier: '二等奖', amount: '浮动（封顶500万）' }
+    if (redHits === 5 && blueHits === 1) return { tier: '三等奖', amount: '3000元' }
+    if (redHits === 5 && blueHits === 0) return { tier: '四等奖', amount: '200元' }
+    if (redHits === 4 && blueHits === 1) return { tier: '四等奖', amount: '200元' }
+    if (redHits === 4 && blueHits === 0) return { tier: '五等奖', amount: '10元' }
+    if (redHits === 3 && blueHits === 1) return { tier: '五等奖', amount: '10元' }
+    if (blueHits === 1 && redHits <= 2) return { tier: '六等奖', amount: '5元' }
+    return null
+  }
+  if (props.type === 'dlt') {
+    if (redHits === 5 && blueHits === 2) return { tier: '一等奖', amount: '浮动（封顶500万/1000万）' }
+    if (redHits === 5 && blueHits === 1) return { tier: '二等奖', amount: '浮动（封顶500万）' }
+    if (redHits === 5 && blueHits === 0) return { tier: '三等奖', amount: '10000元' }
+    if (redHits === 4 && blueHits === 2) return { tier: '四等奖', amount: '3000元' }
+    if (redHits === 4 && blueHits === 1) return { tier: '五等奖', amount: '300元' }
+    if (redHits === 3 && blueHits === 2) return { tier: '六等奖', amount: '200元' }
+    if (redHits === 4 && blueHits === 0) return { tier: '七等奖', amount: '100元' }
+    if (redHits === 3 && blueHits === 1) return { tier: '八等奖', amount: '15元' }
+    if (redHits === 2 && blueHits === 2) return { tier: '八等奖', amount: '15元' }
+    if (redHits === 3 && blueHits === 0) return { tier: '九等奖', amount: '5元' }
+    if (redHits === 2 && blueHits === 1) return { tier: '九等奖', amount: '5元' }
+    if (redHits === 1 && blueHits === 2) return { tier: '九等奖', amount: '5元' }
+    if (redHits === 0 && blueHits === 2) return { tier: '九等奖', amount: '5元' }
+    return null
+  }
+  return null
+}
+
 const bestPredictionThisIssue = computed(() => {
   const preds = Array.isArray(hitStats.value?.recent_predictions) ? hitStats.value.recent_predictions : []
   if (!preds.length) return null
@@ -671,6 +719,33 @@ const fetchHistory = async () => {
   } finally {
     loading.value = false
   }
+}
+
+const refreshAll = async (issue = null) => {
+  if (issue) latestIssue.value = String(issue)
+  await fetchHistory()
+  predictions.value = []
+  await ensureDefaultPredictions()
+  await fetchHitStats()
+}
+
+const startFallbackPoll = () => {
+  if (latestFallbackTimer) window.clearInterval(latestFallbackTimer)
+  latestFallbackTimer = window.setInterval(async () => {
+    try {
+      if (document.visibilityState !== 'visible') return
+      const res = await fetch(`/api/latest/${props.type}`, { cache: 'no-store' })
+      if (!res.ok) return
+      const data = await res.json()
+      const issue = data && data.issue ? String(data.issue) : null
+      const shown = latestResult.value && latestResult.value.issue ? String(latestResult.value.issue) : null
+      if (issue && issue !== shown) {
+        await refreshAll(issue)
+      }
+    } catch (e) {
+      return
+    }
+  }, 20000)
 }
 
 const fetchPredictionItems = async (limit = 5, offset = 0) => {
@@ -869,25 +944,22 @@ const startLatestStream = () => {
 
     latestStream.addEventListener('update', async (evt) => {
       const issue = evt && evt.data ? String(evt.data) : null
-      if (issue && issue !== latestIssue.value) {
-        latestIssue.value = issue
-        await fetchHistory()
-        predictions.value = []
-        await ensureDefaultPredictions()
-        await fetchHitStats()
-      }
+      await refreshAll(issue)
       if (latestStream) latestStream.close()
       latestStream = null
+      latestPollTimer = window.setTimeout(() => startLatestStream(), 1500)
     })
 
     latestStream.addEventListener('timeout', () => {
       if (latestStream) latestStream.close()
       latestStream = null
+      latestPollTimer = window.setTimeout(() => startLatestStream(), 1500)
     })
 
     latestStream.onerror = () => {
       if (latestStream) latestStream.close()
       latestStream = null
+      latestPollTimer = window.setTimeout(() => startLatestStream(), 2500)
     }
   } catch (e) {
     predictionsError.value = (e && e.message) ? e.message : String(e)
@@ -912,12 +984,14 @@ watch(() => props.type, () => {
     await fetchHitStats()
   })
   startLatestStream()
+  startFallbackPoll()
 })
 
 onMounted(() => {
   fetchHistory().then(() => ensureDefaultPredictions())
   fetchHitStats()
   startLatestStream()
+  startFallbackPoll()
   window.addEventListener('scroll', onScroll, { passive: true })
   showToTopButton.value = false
 })
@@ -925,6 +999,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (latestPollTimer) window.clearInterval(latestPollTimer)
   latestPollTimer = null
+  if (latestFallbackTimer) window.clearInterval(latestFallbackTimer)
+  latestFallbackTimer = null
   if (latestStream) latestStream.close()
   latestStream = null
   window.removeEventListener('scroll', onScroll)

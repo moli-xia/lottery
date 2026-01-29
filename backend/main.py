@@ -17,9 +17,11 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import sys
 import subprocess
 import shutil
+import threading
 
 
 
@@ -780,17 +782,135 @@ def get_hit_stats(lottery_type: str, db: Session = Depends(get_db), cycles_limit
 
 
 @app.post("/api/scrape/{lottery_type}")
-def scrape_data(lottery_type: str, db: Session = Depends(get_db)):
+def scrape_data(
+    lottery_type: str,
+    limit: int = 100,
+    upsert: bool = False,
+    issue: str = "",
+    fill_missing: bool = True,
+    db: Session = Depends(get_db),
+):
     s = scraper.LotteryScraper(db)
     if lottery_type == 'ssq':
-        count = s.scrape_ssq(limit=100)
+        stats = s.scrape_ssq(limit=limit, upsert=upsert, want_issue=issue or None)
     elif lottery_type == 'dlt':
-        count = s.scrape_dlt(limit=100)
+        stats = s.scrape_dlt(limit=limit, upsert=upsert, want_issue=issue or None)
     else:
         raise HTTPException(status_code=400, detail="Invalid lottery type")
+    added = 0
+    updated = 0
+    seen = 0
+    if isinstance(stats, dict):
+        try:
+            added = int(stats.get("added") or 0)
+        except Exception:
+            added = 0
+        try:
+            updated = int(stats.get("updated") or 0)
+        except Exception:
+            updated = 0
+        try:
+            seen = int(stats.get("seen") or 0)
+        except Exception:
+            seen = 0
+
+    if fill_missing and not (issue or "").strip():
+        try:
+            extra = _backfill_missing_issues(db, lottery_type, base_limit=limit, max_limit=3000, years=2, max_rounds=6)
+            if isinstance(extra, dict):
+                try:
+                    added += int(extra.get("added") or 0)
+                except Exception:
+                    pass
+                try:
+                    updated += int(extra.get("updated") or 0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     evaluate_predictions(db, lottery_type)
     ensure_predictions_for_cycle(db, lottery_type, min_count=20)
-    return {"message": f"Scraped {count} new records for {lottery_type}"}
+
+    try:
+        _notify_latest_issue(lottery_type)
+    except Exception:
+        pass
+    return {"message": f"Scraped {added} new records, updated {updated} records (seen {seen}) for {lottery_type}"}
+
+def _missing_issues_for_year(db: Session, lottery_type: str, year: int) -> list[int]:
+    prefix = f"{year:02d}"
+    rows = (
+        db.query(models.LotteryRecord.issue)
+        .filter_by(lottery_type=lottery_type)
+        .filter(models.LotteryRecord.issue.like(f"{prefix}%"))
+        .all()
+    )
+    issues: list[int] = []
+    for (s,) in rows:
+        iv = issue_to_int(s)
+        if iv is None or iv // 1000 != year:
+            continue
+        issues.append(iv)
+    if not issues:
+        return []
+    present = {iv % 1000 for iv in issues}
+    max_seq = max(present)
+    missing: list[int] = []
+    for seq in range(1, max_seq + 1):
+        if seq not in present:
+            missing.append(year * 1000 + seq)
+    return missing
+
+def _backfill_missing_issues(
+    db: Session,
+    lottery_type: str,
+    base_limit: int,
+    max_limit: int = 3000,
+    years: int = 2,
+    max_rounds: int = 6,
+) -> dict:
+    latest = (
+        db.query(models.LotteryRecord)
+        .filter_by(lottery_type=lottery_type)
+        .order_by(models.LotteryRecord.issue.desc())
+        .first()
+    )
+    latest_int = issue_to_int(latest.issue) if latest else None
+    if latest_int is None:
+        return {"added": 0, "updated": 0}
+
+    scraper_inst = scraper.LotteryScraper(db)
+    cur_limit = max(1, int(base_limit or 0))
+    total_added = 0
+    total_updated = 0
+
+    for _ in range(max_rounds):
+        year0 = latest_int // 1000
+        candidates: list[int] = []
+        for i in range(max(1, int(years or 0))):
+            candidates.extend(_missing_issues_for_year(db, lottery_type, year0 - i))
+        if not candidates:
+            break
+        target_issue = str(min(candidates))
+        if cur_limit >= max_limit:
+            break
+        cur_limit = min(max_limit, max(cur_limit * 2, cur_limit + 200))
+        if lottery_type == "ssq":
+            st = scraper_inst.scrape_ssq(limit=cur_limit, upsert=True, want_issue=target_issue)
+        else:
+            st = scraper_inst.scrape_dlt(limit=cur_limit, upsert=True, want_issue=target_issue)
+        if isinstance(st, dict):
+            try:
+                total_added += int(st.get("added") or 0)
+            except Exception:
+                pass
+            try:
+                total_updated += int(st.get("updated") or 0)
+            except Exception:
+                pass
+
+    return {"added": total_added, "updated": total_updated}
 
 @app.post("/api/predict/{lottery_type}")
 def predict_numbers(lottery_type: str, count: int = 5, db: Session = Depends(get_db)):
@@ -1187,9 +1307,15 @@ async def smart_scrape_loop():
 
                         s = scraper.LotteryScraper(db)
                         if lt == "ssq":
-                            count = s.scrape_ssq(limit=1)
+                            stats = s.scrape_ssq(limit=1)
                         else:
-                            count = s.scrape_dlt(limit=1)
+                            stats = s.scrape_dlt(limit=1)
+                        count = 0
+                        if isinstance(stats, dict):
+                            try:
+                                count = int(stats.get("added") or 0)
+                            except Exception:
+                                count = 0
 
                         latest_after = (
                             db.query(models.LotteryRecord)
@@ -1239,13 +1365,19 @@ async def stream_latest(lottery_type: str, db: Session = Depends(get_db)):
 
     async def gen():
         yield f"event: init\ndata: {initial_issue}\n\n"
-        try:
-            await asyncio.wait_for(ev.wait(), timeout=3_600)
-        except asyncio.TimeoutError:
-            yield "event: timeout\ndata: \n\n"
-            return
-        finally:
-            ev.clear()
+        deadline = asyncio.get_event_loop().time() + 3_600
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                yield "event: timeout\ndata: \n\n"
+                return
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=min(15.0, remaining))
+                break
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+        ev.clear()
 
         latest = (
             db.query(models.LotteryRecord)
@@ -1256,7 +1388,12 @@ async def stream_latest(lottery_type: str, db: Session = Depends(get_db)):
         issue = latest.issue if latest else ""
         yield f"event: update\ndata: {issue}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
 @app.on_event("startup")
 async def on_startup():
@@ -1570,6 +1707,81 @@ def admin_action_regenerate_predictions(request: Request, db: Session = Depends(
         request.session["admin_flash"] = {"kind": "err", "text": "重新推算失败：" + str(e)}
     return RedirectResponse(url="/admin", status_code=303)
 
+def _admin_backfill_one(request: Request, db: Session, lottery_type: str, backfill_issue: str = ""):
+    backfill_issue = (backfill_issue or "").strip()
+    before_latest = (
+        db.query(models.LotteryRecord)
+        .filter_by(lottery_type=lottery_type)
+        .order_by(models.LotteryRecord.issue.desc())
+        .first()
+    )
+    before_issue = before_latest.issue if before_latest else ""
+
+    limit = 2000 if not backfill_issue else 2000
+    data = scrape_data(lottery_type, limit=limit, upsert=True, issue=backfill_issue, db=db)
+    message = ""
+    if isinstance(data, dict):
+        message = str(data.get("message") or "")
+
+    if backfill_issue:
+        got = (
+            db.query(models.LotteryRecord)
+            .filter_by(lottery_type=lottery_type, issue=backfill_issue)
+            .first()
+        )
+        if not got:
+            request.session["admin_flash"] = {
+                "kind": "err",
+                "text": f"补抓完成但未找到期号 {backfill_issue}（已尝试抓取最近 {limit} 期）\n{message}".strip(),
+            }
+            return
+        got_date = got.date.isoformat() if getattr(got, "date", None) else ""
+        request.session["admin_flash"] = {
+            "kind": "msg",
+            "text": f"补抓完成：已获取期号 {backfill_issue}" + (f"（{got_date}）" if got_date else "") + "\n" + (message or ""),
+        }
+        return
+
+    after_latest = (
+        db.query(models.LotteryRecord)
+        .filter_by(lottery_type=lottery_type)
+        .order_by(models.LotteryRecord.issue.desc())
+        .first()
+    )
+    after_issue = after_latest.issue if after_latest else ""
+    after_date = after_latest.date.isoformat() if getattr(after_latest, "date", None) else ""
+
+    extra = ""
+    if after_issue:
+        extra = f"\n最新期：{after_issue}" + (f"（{after_date}）" if after_date else "")
+        if before_issue and after_issue != before_issue:
+            extra = "\n新增最新期：" + after_issue + (f"（{after_date}）" if after_date else "")
+    request.session["admin_flash"] = {"kind": "msg", "text": "补抓完成：" + (message or "已执行") + extra}
+
+@app.post("/admin/action/scrape-ssq")
+def admin_action_scrape_ssq(request: Request, backfill_issue: str = Form(""), db: Session = Depends(get_db)):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        _admin_backfill_one(request, db, "ssq", backfill_issue=backfill_issue)
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "补抓失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "补抓失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/action/scrape-dlt")
+def admin_action_scrape_dlt(request: Request, backfill_issue: str = Form(""), db: Session = Depends(get_db)):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+    try:
+        _admin_backfill_one(request, db, "dlt", backfill_issue=backfill_issue)
+    except HTTPException as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "补抓失败：" + str(e.detail or "")}
+    except Exception as e:
+        request.session["admin_flash"] = {"kind": "err", "text": "补抓失败：" + str(e)}
+    return RedirectResponse(url="/admin", status_code=303)
+
 @app.post("/admin/action/test-llm")
 def admin_action_test_llm(
     request: Request,
@@ -1649,6 +1861,143 @@ def admin_action_change_password(
         request.session["admin_flash"] = {"kind": "err", "text": "修改失败：" + str(e)}
     return RedirectResponse(url="/admin", status_code=303)
 
+@app.post("/admin/action/restart-backend")
+def admin_action_restart_backend(request: Request, db: Session = Depends(get_db)):
+    if not is_admin_session(request, db):
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    port = 8888
+    try:
+        port = int(os.getenv("PORT") or os.getenv("APP_PORT") or "8888")
+    except Exception:
+        port = 8888
+    log_path = os.path.join(project_dir, f"uvicorn-{port}.log")
+    pid_path = os.path.join(project_dir, f"uvicorn-{port}.pid")
+    host = os.getenv("HOST") or "0.0.0.0"
+
+    helper = r"""
+import os, sys, time, subprocess, signal, socket
+pid = int(sys.argv[1])
+project_dir = sys.argv[2]
+host = sys.argv[3]
+port = int(sys.argv[4])
+log_path = sys.argv[5]
+pid_path = sys.argv[6]
+delay_s = float(sys.argv[7])
+time.sleep(delay_s)
+try:
+    os.kill(pid, signal.SIGTERM)
+except Exception:
+    pass
+deadline = time.time() + 12.0
+while time.time() < deadline:
+    try:
+        os.kill(pid, 0)
+        time.sleep(0.2)
+    except Exception:
+        break
+else:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    time.sleep(0.4)
+def port_open() -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        try:
+            s.close()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+deadline = time.time() + 12.0
+while time.time() < deadline:
+    if port_open():
+        raise SystemExit(0)
+    time.sleep(0.3)
+
+out = open(log_path, "a", encoding="utf-8", errors="ignore")
+cmd = [
+    sys.executable,
+    "-m",
+    "uvicorn",
+    "backend.main:app",
+    "--app-dir",
+    project_dir,
+    "--host",
+    host,
+    "--port",
+    str(port),
+]
+p = subprocess.Popen(cmd, stdout=out, stderr=out, start_new_session=True)
+try:
+    with open(pid_path, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(str(p.pid))
+except Exception:
+    pass
+"""
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", helper, str(os.getpid()), project_dir, host, str(port), log_path, pid_path, "1.6"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        threading.Thread(target=lambda: os._exit(0), daemon=True).start()
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>重启中…</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background: radial-gradient(1200px 600px at 20% 0%, #1f2937 0%, #0b1220 55%, #060913 100%); color: #e5e7eb; }
+      .wrap { max-width: 780px; margin: 0 auto; padding: 24px; }
+      .card { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.10); border-radius: 18px; padding: 18px; box-shadow: 0 30px 80px rgba(0,0,0,.35); backdrop-filter: blur(10px); }
+      h1 { font-size: 18px; margin: 0 0 10px; }
+      p { margin: 0; color: rgba(229,231,235,.80); font-size: 13px; line-height: 1.6; }
+      a { color: rgba(147,197,253,.95); text-decoration: none; font-weight: 700; }
+      .hint { margin-top: 12px; font-size: 12px; color: rgba(229,231,235,.62); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>已触发重启</h1>
+        <p>后端服务正在重启中。页面短暂不可用属于正常现象，约数秒后恢复。</p>
+        <div class="hint">恢复后将自动返回后台管理页：<a href="/admin">/admin</a></div>
+      </div>
+    </div>
+    <script>
+      const maxTry = 90
+      let tries = 0
+      const tick = async () => {
+        tries += 1
+        try {
+          const r = await fetch('/api/latest/dlt', { cache: 'no-store' })
+          if (r && r.ok) {
+            location.href = '/admin'
+            return
+          }
+        } catch (e) {}
+        if (tries < maxTry) setTimeout(tick, 700)
+      }
+      setTimeout(tick, 900)
+    </script>
+  </body>
+</html>
+        """.strip()
+    )
+
 
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page():
@@ -1722,21 +2071,30 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
     <style>
       :root { color-scheme: dark; }
       body { margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background: radial-gradient(1200px 600px at 20% 0%, #1f2937 0%, #0b1220 55%, #060913 100%); color: #e5e7eb; }
-      .wrap { max-width: 900px; margin: 0 auto; padding: 24px; }
+      .wrap { max-width: 1080px; margin: 0 auto; padding: 24px; }
       .card { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.10); border-radius: 18px; padding: 18px; box-shadow: 0 30px 80px rgba(0,0,0,.35); backdrop-filter: blur(10px); }
       h1 { font-size: 22px; margin: 0 0 6px; }
       p { margin: 0; color: rgba(229,231,235,.75); font-size: 13px; }
       .head { display:flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
-      .head .rt { display:flex; align-items:center; gap: 10px; }
-      .grid { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 14px; }
-      @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+      .head .rt { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+      .layout { display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 14px; }
+      @media (min-width: 920px) { .layout { grid-template-columns: 1.1fr 0.9fr; } }
+      .stack { display:flex; flex-direction: column; gap: 12px; }
+      .panel { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.10); border-radius: 16px; padding: 14px; }
+      .panel-title { font-size: 14px; font-weight: 900; margin: 0; color: rgba(255,255,255,.92); display:flex; align-items:center; gap: 10px; }
+      .panel-title .dot { width: 8px; height: 8px; border-radius: 99px; background: rgba(255,255,255,.25); }
+      .panel-desc { margin: 6px 0 0; font-size: 12px; color: rgba(229,231,235,.70); }
+      .field-grid { display:grid; grid-template-columns: 1fr; gap: 10px; margin-top: 12px; }
+      @media (min-width: 720px) { .field-grid.cols-2 { grid-template-columns: 1fr 1fr; } }
       label { display:block; font-size: 12px; color: rgba(229,231,235,.85); margin: 10px 0 6px; }
       input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: #e5e7eb; outline: none; }
       input:focus { border-color: rgba(255,255,255,.25); box-shadow: 0 0 0 4px rgba(255,255,255,.08); }
-      .row { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+      .row { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
       button { border: 0; padding: 10px 14px; border-radius: 12px; font-weight: 700; cursor: pointer; }
       .primary { background: #ffffff; color: #0b1220; }
       .ghost { background: rgba(255,255,255,.08); color: #e5e7eb; border: 1px solid rgba(255,255,255,.12); }
+      .danger { background: rgba(244,63,94,.16); color: rgba(253,164,175,.95); border: 1px solid rgba(244,63,94,.28); }
+      .pill { display:inline-flex; align-items:center; gap: 8px; padding: 10px 14px; border-radius: 12px; font-weight: 800; border: 1px solid rgba(255,255,255,.12); text-decoration:none; }
       .msg { margin-top: 10px; font-size: 13px; color: rgba(167,243,208,.95); display:none; }
       .err { margin-top: 10px; font-size: 13px; color: rgba(253,164,175,.95); display:none; white-space: pre-wrap; }
       .hint { margin-top: 12px; font-size: 12px; color: rgba(229,231,235,.62); }
@@ -1749,64 +2107,100 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
         <div class="head">
           <div>
             <h1>魔力彩票助手：后台管理</h1>
-            <p>该页面用于配置大模型 API（需先登录）。</p>
+            <p>AI 配置 · 数据运维 · 安全设置</p>
           </div>
           <div class="rt">
-            <a href="/" class="ghost" style="display:inline-flex; align-items:center; justify-content:center; padding: 10px 14px; border-radius: 12px; font-weight: 700; text-decoration:none;" target="_blank" rel="noopener noreferrer" title="打开前台首页">前台首页</a>
-            <form method="get" action="/admin/logout" style="margin:0">
-              <button type="submit" class="ghost" id="logout" title="退出后台">退出</button>
+            <a href="/" class="pill ghost" target="_blank" rel="noopener noreferrer" title="打开前台首页">前台首页</a>
+            <form method="post" action="/admin/action/restart-backend" style="margin:0">
+              <button type="submit" class="pill danger" id="restartBackendTop" title="重启后端服务">重启应用</button>
             </form>
+            <a href="/admin/logout" class="pill ghost" id="logout" title="退出后台">退出</a>
           </div>
         </div>
-
-        <form method="post" action="/admin/action/save-settings" style="margin: 0;">
-          <div class="grid">
-            <div>
-              <label>LLM API Key</label>
-              <input id="k" name="llm_api_key" type="password" placeholder="sk-..." />
-            </div>
-            <div>
-              <label>LLM Base URL（可选）</label>
-              <input id="b" name="llm_base_url" placeholder="https://api.siliconflow.cn/v1" />
-            </div>
-          </div>
-
-          <div>
-            <label>LLM 模型名</label>
-            <input id="m" name="llm_model" placeholder="deepseek-ai/DeepSeek-V3" />
-            <div class="hint">示范配置：<span class="mono">Base URL=https://api.siliconflow.cn/v1</span>，<span class="mono">Model=deepseek-ai/DeepSeek-V3</span></div>
-          </div>
-
-          <div class="row">
-            <button type="submit" class="ghost" id="test" formaction="/admin/action/test-llm">测试配置</button>
-            <button type="submit" class="primary" id="save" formaction="/admin/action/save-settings">保存</button>
-            <button type="submit" class="ghost" id="syncTime" formaction="/admin/action/sync-time" style="margin-left: auto;">校准时间(上海)</button>
-            <button type="submit" class="ghost" id="regenerate" formaction="/admin/action/regenerate-predictions">重新推算</button>
-          </div>
-        </form>
 
         <div class="msg" id="msg"></div>
         <div class="err" id="err"></div>
 
-        <form method="post" action="/admin/action/change-password" style="margin: 0;">
-          <div class="grid" style="margin-top: 18px;">
-            <div>
-              <label>原密码</label>
-              <input id="oldpw" name="old_password" type="password" autocomplete="current-password" />
+        <div class="layout">
+          <div class="stack">
+            <div class="panel">
+              <div class="panel-title"><span class="dot"></span>AI 配置</div>
+              <div class="panel-desc">用于生成每期开奖后的 20 组预测号码</div>
+              <form method="post" action="/admin/action/save-settings" style="margin: 0;">
+                <div class="field-grid cols-2">
+                  <div>
+                    <label>LLM API Key</label>
+                    <input id="k" name="llm_api_key" type="password" placeholder="sk-..." />
+                  </div>
+                  <div>
+                    <label>LLM Base URL（可选）</label>
+                    <input id="b" name="llm_base_url" placeholder="https://api.siliconflow.cn/v1" />
+                  </div>
+                </div>
+                <div style="margin-top: 10px;">
+                  <label>LLM 模型名</label>
+                  <input id="m" name="llm_model" placeholder="deepseek-ai/DeepSeek-V3" />
+                  <div class="hint">示范：<span class="mono">Base URL=https://api.siliconflow.cn/v1</span>，<span class="mono">Model=deepseek-ai/DeepSeek-V3</span></div>
+                </div>
+                <div class="row">
+                  <button type="submit" class="ghost" id="test" formaction="/admin/action/test-llm">测试配置</button>
+                  <button type="submit" class="primary" id="save" formaction="/admin/action/save-settings">保存</button>
+                </div>
+              </form>
             </div>
-            <div>
-              <label>新密码（至少 8 位）</label>
-              <input id="newpw" name="new_password" type="password" autocomplete="new-password" />
-            </div>
-          </div>
-          <div class="row">
-            <button type="submit" class="primary" id="changepw">修改密码</button>
-          </div>
-        </form>
 
-        <div class="hint">
-          默认账号：<span class="mono">admin</span> / <span class="mono">admin</span>（建议通过环境变量修改用户名：<span class="mono">ADMIN_USERNAME</span>；会话密钥：<span class="mono">SESSION_SECRET</span>）
+            <div class="panel">
+              <div class="panel-title"><span class="dot"></span>数据运维</div>
+              <div class="panel-desc">补抓开奖 · 校准时间 · 重新推算</div>
+              <form method="post" action="/admin/action/scrape-dlt" style="margin: 0;">
+                <div class="field-grid cols-2">
+                  <div>
+                    <label>补抓期号（可选）</label>
+                    <input name="backfill_issue" placeholder="如 26012" />
+                    <div class="hint">留空表示按近期自动补齐</div>
+                  </div>
+                  <div>
+                    <label>快捷动作</label>
+                    <div class="row" style="margin-top: 0;">
+                      <button type="submit" class="ghost" id="syncTime" formaction="/admin/action/sync-time">校准时间(上海)</button>
+                      <button type="submit" class="ghost" id="regenerate" formaction="/admin/action/regenerate-predictions">重新推算</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="row">
+                  <button type="submit" class="ghost" id="scrapeSsq" formaction="/admin/action/scrape-ssq">补抓双色球开奖</button>
+                  <button type="submit" class="ghost" id="scrapeDlt" formaction="/admin/action/scrape-dlt">补抓大乐透开奖</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="stack">
+            <div class="panel">
+              <div class="panel-title"><span class="dot"></span>安全设置</div>
+              <div class="panel-desc">建议首次登录后修改密码</div>
+              <form method="post" action="/admin/action/change-password" style="margin: 0;">
+                <div class="field-grid">
+                  <div>
+                    <label>原密码</label>
+                    <input id="oldpw" name="old_password" type="password" autocomplete="current-password" />
+                  </div>
+                  <div>
+                    <label>新密码（至少 8 位）</label>
+                    <input id="newpw" name="new_password" type="password" autocomplete="new-password" />
+                  </div>
+                </div>
+                <div class="row">
+                  <button type="submit" class="primary" id="changepw">修改密码</button>
+                </div>
+              </form>
+              <div class="hint">
+                默认账号：<span class="mono">admin</span> / <span class="mono">admin</span>（建议通过环境变量修改用户名：<span class="mono">ADMIN_USERNAME</span>；会话密钥：<span class="mono">SESSION_SECRET</span>）
+              </div>
+            </div>
+          </div>
         </div>
+
       </div>
     </div>
 
