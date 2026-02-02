@@ -11,9 +11,9 @@
 
   <summary>项目截图</summary>
  
-  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo1.png" alt="项目截图" style="max-width:600px">
-  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo2.png" alt="项目截图" style="max-width:600px">
-  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo3.png" alt="项目截图" style="max-width:600px">
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/demo1.png" alt="项目截图" style="max-width:600px">
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/demo2.png" alt="项目截图" style="max-width:600px">
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/demo3.png" alt="项目截图" style="max-width:600px">
 
 ## Docker 部署（推荐）
 
