@@ -1,0 +1,15 @@
+services:
+  lottery:
+    image: superneed/lottery:latest
+    container_name: lottery
+    restart: always
+    ports:
+      - "8888:8888"
+    environment:
+      TZ: Asia/Shanghai
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin
+      SESSION_SECRET: ${SESSION_SECRET:-dev-secret}
+      DB_PATH: /app/data/lottery.db
+    volumes:
+      - ./data:/app/data
