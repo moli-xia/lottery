@@ -9,6 +9,12 @@
 - 前端实时刷新（SSE），后端 FastAPI + SQLite 持久化
 - 后台 `/admin`：配置 LLM、测试连通性、修改后台密码
 
+  <summary>项目截图</summary>
+ 
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo1.png" alt="项目截图" style="max-width:600px">
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo2.png" alt="项目截图" style="max-width:600px">
+  <img src="https://raw.githubusercontent.com/moli-xia/lottery/main/public/demo3.png" alt="项目截图" style="max-width:600px">
+
 ## Docker 部署（推荐）
 
 镜像地址：`superneed/lottery`（支持 `linux/amd64` 与 `linux/arm64`）
